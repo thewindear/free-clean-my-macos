@@ -8,12 +8,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/thewindear/free-clean-my-macos/internal/clean"
 	"github.com/thewindear/free-clean-my-macos/internal/engine"
+	"github.com/thewindear/free-clean-my-macos/internal/owner"
 	"github.com/thewindear/free-clean-my-macos/internal/rules"
 )
 
@@ -29,11 +33,11 @@ const usage = `fcm — whitelist-based macOS junk scanner
 
 Usage:
   fcm                      open the TUI (not built yet)
-  fcm scan [--json] [--compact] [--rules-dir DIR]
+  fcm scan [--json] [--compact] [--rules-dir DIR] [--jobs N]
                            scan and report, exit 3 when there is nothing to clean
-  fcm clean --dry-run [--json] [--only-kind cache,log]
+  fcm clean --dry-run [--json] [--only-kind cache,log] [--jobs N]
                            print the removal plan and touch nothing
-  fcm clean --yes [--json] [--trash-dir DIR] [--only-kind cache,log]
+  fcm clean --yes [--json] [--trash-dir DIR] [--only-kind cache,log] [--jobs N]
                            remove every Junk Item: cheap ones deleted outright,
                            the rest moved into the Trash
   fcm help                 show this message
@@ -43,8 +47,13 @@ same name as an embedded one replaces it. ~/.config/free-clean-my-macos/ignore.y
 excludes path patterns from every scan.
 `
 
-// Run executes one command line and returns the process exit code.
+// Run executes one command line and returns the process exit code. The
+// context is cancelled by SIGINT/SIGTERM, so an interrupted scan still emits
+// the partial Report it has.
 func Run(args []string, stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "fcm: the TUI is not built yet; run `fcm scan --json`")
 		return ExitUsage
@@ -55,22 +64,27 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, usage)
 		return ExitOK
 	case "scan":
-		return runScan(args[1:], stdout, stderr)
+		return runScan(ctx, args[1:], stdout, stderr)
 	case "clean":
-		return runClean(args[1:], stdout, stderr)
+		return runClean(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "fcm: unknown command %q\n\n%s", args[0], usage)
 		return ExitUsage
 	}
 }
 
-func runScan(args []string, stdout, stderr io.Writer) int {
+func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit the schema v1 JSON document")
 	compact := fs.Bool("compact", false, "emit single-line JSON (implies --json)")
 	rulesDir := fs.String("rules-dir", "", "load user Scan Rules from this directory")
+	jobs := fs.Int("jobs", 0, "bounded scan parallelism (default min(8, NumCPU/2))")
 	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if *jobs < 0 {
+		fmt.Fprintln(stderr, "fcm scan: --jobs must be positive")
 		return ExitUsage
 	}
 	if fs.NArg() > 0 {
@@ -81,12 +95,12 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		*asJSON = true
 	}
 
-	opts, err := options(*rulesDir)
+	opts, err := options(*rulesDir, *jobs)
 	if err != nil {
 		fmt.Fprintf(stderr, "fcm scan: %v\n", err)
 		return ExitPartialFailed
 	}
-	report, err := engine.Scan(context.Background(), opts)
+	report, err := engine.Scan(ctx, opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "fcm scan: %v\n", err)
 		return ExitPartialFailed
@@ -101,7 +115,10 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		writeText(stdout, report)
 	}
 
-	if report.Summary.Items == 0 {
+	// A run that found nothing but did skip unreadable/running/timed-out
+	// paths is still a successful, honest scan: it is not the same as a clean
+	// machine, so it does not get the nothing-to-do exit code.
+	if report.Summary.Items == 0 && len(report.Skipped) == 0 {
 		return ExitNothingToDo
 	}
 	return ExitOK
@@ -120,7 +137,7 @@ func writeJSON[T any](w io.Writer, doc T, compact bool) error {
 // runClean scans, then removes the selection according to the hybrid policy.
 // --dry-run prints the plan and touches nothing; --yes executes it, and the
 // Cleanup Log makes the execution auditable after the fact.
-func runClean(args []string, stdout, stderr io.Writer) int {
+func runClean(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dryRun := fs.Bool("dry-run", false, "print the plan and touch nothing")
@@ -130,7 +147,12 @@ func runClean(args []string, stdout, stderr io.Writer) int {
 	trashDir := fs.String("trash-dir", "", "where items that are not deleted outright are moved (default $HOME/.Trash)")
 	onlyKind := fs.String("only-kind", "", "comma-separated Kind filter, e.g. cache,log")
 	rulesDir := fs.String("rules-dir", "", "load user Scan Rules from this directory")
+	jobs := fs.Int("jobs", 0, "bounded scan parallelism (default min(8, NumCPU/2))")
 	if err := fs.Parse(args); err != nil {
+		return ExitUsage
+	}
+	if *jobs < 0 {
+		fmt.Fprintln(stderr, "fcm clean: --jobs must be positive")
 		return ExitUsage
 	}
 	if fs.NArg() > 0 {
@@ -150,12 +172,12 @@ func runClean(args []string, stdout, stderr io.Writer) int {
 		return ExitUsage
 	}
 
-	opts, err := options(*rulesDir)
+	opts, err := options(*rulesDir, *jobs)
 	if err != nil {
 		fmt.Fprintf(stderr, "fcm clean: %v\n", err)
 		return ExitPartialFailed
 	}
-	report, err := engine.Scan(context.Background(), opts)
+	report, err := engine.Scan(ctx, opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "fcm clean: %v\n", err)
 		return ExitPartialFailed
@@ -166,7 +188,7 @@ func runClean(args []string, stdout, stderr io.Writer) int {
 	if trash == "" {
 		trash = filepath.Join(home, ".Trash")
 	}
-	result, err := clean.Run(context.Background(), report, clean.Options{
+	result, err := clean.Run(ctx, report, clean.Options{
 		TrashDir:  trash,
 		StateDir:  stateDir(home),
 		DryRun:    *dryRun,
@@ -336,7 +358,7 @@ func humanBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGT"[exp])
 }
 
-func options(rulesDir string) (engine.Options, error) {
+func options(rulesDir string, jobs int) (engine.Options, error) {
 	home := os.Getenv("HOME")
 	configDir := filepath.Join(home, ".config", "free-clean-my-macos")
 	if rulesDir == "" {
@@ -352,18 +374,75 @@ func options(rulesDir string) (engine.Options, error) {
 		return engine.Options{}, fmt.Errorf("loading ignore list: %w", err)
 	}
 
+	timeout, err := pathTimeout()
+	if err != nil {
+		return engine.Options{}, err
+	}
+	now, err := fixedNow()
+	if err != nil {
+		return engine.Options{}, err
+	}
+
 	selfBinary, _ := os.Executable()
 	return engine.Options{
-		Home:       home,
-		TmpDir:     os.Getenv("TMPDIR"),
-		Rules:      rules.Merge(rules.Default(), userRules),
-		AppsDirs:   appsDirs(home),
-		Ignore:     ignore,
-		ConfigDir:  configDir,
-		StateDir:   filepath.Join(home, ".local", "state", "free-clean-my-macos"),
-		SelfBinary: selfBinary,
-		SystemRoot: os.Getenv("FCM_SYSTEM_ROOT"),
+		Home:        home,
+		TmpDir:      os.Getenv("TMPDIR"),
+		Rules:       rules.Merge(rules.Default(), userRules),
+		AppsDirs:    appsDirs(home),
+		Ignore:      ignore,
+		ConfigDir:   configDir,
+		StateDir:    stateDir(home),
+		SelfBinary:  selfBinary,
+		SystemRoot:  os.Getenv("FCM_SYSTEM_ROOT"),
+		PathTimeout: timeout,
+		Jobs:        jobs,
+		Now:         now,
+		Running:     runningProbe(),
 	}, nil
+}
+
+// runningProbe reads the real process table unless FCM_RUNNING_OWNERS is set.
+// The override exists so process-boundary tests can isolate themselves from
+// apps that happen to be running on the developer's Mac.
+func runningProbe() func(owner.Owner) bool {
+	raw, set := os.LookupEnv("FCM_RUNNING_OWNERS")
+	if !set {
+		return owner.NewRunningProbe()
+	}
+	var processes []string
+	for _, name := range strings.Split(raw, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			processes = append(processes, name)
+		}
+	}
+	return func(o owner.Owner) bool { return owner.IsRunning(o, processes) }
+}
+
+// pathTimeout reads the FCM_PATH_TIMEOUT test seam. Production scans use the
+// engine's 30 second default.
+func pathTimeout() (time.Duration, error) {
+	raw := os.Getenv("FCM_PATH_TIMEOUT")
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("FCM_PATH_TIMEOUT: %w", err)
+	}
+	return d, nil
+}
+
+// fixedNow reads the FCM_NOW test seam so temp-expiry tests can inject a clock.
+func fixedNow() (func() time.Time, error) {
+	raw := os.Getenv("FCM_NOW")
+	if raw == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, fmt.Errorf("FCM_NOW: %w", err)
+	}
+	return func() time.Time { return t }, nil
 }
 
 // stateDir is where the Cleanup Log lives. It follows XDG_STATE_HOME when the

@@ -9,8 +9,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,8 +44,15 @@ type Options struct {
 	// a fixture so process-boundary tests never read the real /Library.
 	SystemRoot string
 
+	// PathTimeout bounds one Junk Item's size walk. Zero means the product
+	// default of 30 seconds.
+	PathTimeout time.Duration
+
+	// Jobs bounds the size walk. Zero means min(8, NumCPU/2).
+	Jobs int
+
 	Now     func() time.Time
-	Running func(ownerID string) bool
+	Running func(owner.Owner) bool
 }
 
 // Item is one Junk Item.
@@ -102,6 +111,11 @@ const (
 	ReasonError        = "error"
 )
 
+const (
+	defaultPathTimeout = 30 * time.Second
+	tempMaxAge         = 7 * 24 * time.Hour
+)
+
 // Scan walks the rule set and returns the Report.
 func Scan(ctx context.Context, opts Options) (Report, error) {
 	started := time.Now()
@@ -109,7 +123,10 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		started = opts.Now()
 	}
 	if opts.Running == nil {
-		opts.Running = func(string) bool { return false }
+		opts.Running = func(owner.Owner) bool { return false }
+	}
+	if opts.PathTimeout <= 0 {
+		opts.PathTimeout = defaultPathTimeout
 	}
 
 	expanded := applySystemRoot(rules.ExpandAll(opts.Rules, opts.Home, opts.TmpDir), opts.SystemRoot)
@@ -125,10 +142,10 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		Summary:   Summary{Failed: []string{}},
 	}
 
-	byID := map[string]*Owner{}
+	var tasks []sizeTask
 	for _, candidate := range candidates(ctx, expanded) {
-		if err := ctx.Err(); err != nil {
-			return report, err
+		if ctx.Err() != nil {
+			break
 		}
 		if excluded(candidate, protected) || rules.Ignored(candidate, ignore) {
 			continue
@@ -142,34 +159,45 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		if rule.OrphansOnly && !res.Orphan {
 			continue
 		}
+		if opts.Running(res) {
+			report.Skipped = append(report.Skipped, Skip{Path: candidate, Reason: ReasonRunning})
+			continue
+		}
+		if rule.Kind == rules.KindTemp && !olderThan(candidate, started, tempMaxAge) {
+			continue
+		}
+
 		kind, risk := rule.Kind, rule.Risk
 		if res.Orphan {
 			kind, risk = rules.KindOrphan, rules.RiskCaution
 		}
-		running := opts.Running(res.ID)
+		tasks = append(tasks, sizeTask{path: candidate, rule: rule, own: res, kind: kind, risk: risk})
+	}
 
-		size, skips, err := duBytes(ctx, candidate, rule, expanded)
-		if err != nil {
-			return report, err
+	results := sizeAll(ctx, opts, expanded, tasks)
+	byID := map[string]*Owner{}
+	for i, r := range results {
+		report.Skipped = append(report.Skipped, r.skips...)
+		if !r.done || !r.ok {
+			continue
 		}
-		report.Skipped = append(report.Skipped, skips...)
-
+		t := tasks[i]
 		item := Item{
-			Path:        candidate,
-			Size:        size,
-			Kind:        kind,
-			Risk:        risk,
-			Rebuild:     rule.Rebuild,
-			Recommended: Recommended(risk, rule.Rebuild, running, res.Recognized, size),
+			Path:        t.path,
+			Size:        r.size,
+			Kind:        t.kind,
+			Risk:        t.risk,
+			Rebuild:     t.rule.Rebuild,
+			Recommended: Recommended(t.risk, t.rule.Rebuild, false, t.own.Recognized, r.size),
 		}
 
-		o, ok := byID[res.ID]
+		o, ok := byID[t.own.ID]
 		if !ok {
-			o = &Owner{ID: res.ID, Name: res.Name, Running: running, Items: []Item{}}
-			byID[res.ID] = o
+			o = &Owner{ID: t.own.ID, Name: t.own.Name, Items: []Item{}}
+			byID[t.own.ID] = o
 		}
 		o.Items = append(o.Items, item)
-		o.Total += size
+		o.Total += r.size
 	}
 
 	for _, o := range byID {
@@ -194,6 +222,84 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 	return report, nil
 }
 
+type sizeTask struct {
+	path string
+	rule rules.Rule
+	own  owner.Owner
+	kind rules.Kind
+	risk rules.Risk
+}
+
+type sizeResult struct {
+	done  bool
+	ok    bool
+	size  int64
+	skips []Skip
+}
+
+// sizeAll walks candidates with bounded parallelism. Owners were resolved
+// before this point, so the resolver is never shared across goroutines.
+func sizeAll(ctx context.Context, opts Options, rs []rules.Rule, tasks []sizeTask) []sizeResult {
+	results := make([]sizeResult, len(tasks))
+	if len(tasks) == 0 {
+		return results
+	}
+
+	jobs := opts.Jobs
+	if jobs <= 0 {
+		jobs = runtime.NumCPU() / 2
+	}
+	if jobs < 1 {
+		jobs = 1
+	}
+	if jobs > 8 {
+		jobs = 8
+	}
+
+	index := make(chan int, len(tasks))
+	for i := range tasks {
+		index <- i
+	}
+	close(index)
+
+	var wg sync.WaitGroup
+	for w := 0; w < jobs; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range index {
+				if ctx.Err() != nil {
+					return
+				}
+				t := tasks[i]
+				size, skips, ok, err := duBytes(ctx, t.path, t.rule, rs, opts.PathTimeout)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					skips = append(skips, Skip{Path: t.path, Reason: ReasonError})
+					results[i] = sizeResult{done: true, skips: skips}
+					continue
+				}
+				results[i] = sizeResult{done: true, ok: ok, size: size, skips: skips}
+			}
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+// olderThan reports whether a temp-scope candidate is old enough to consider.
+// A path that cannot be inspected is left to the sizer, which records the
+// appropriate skip reason.
+func olderThan(path string, now time.Time, age time.Duration) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return true
+	}
+	return info.ModTime().Before(now.Add(-age))
+}
+
 // candidates lists every path the rule set could claim: the children matched
 // by each wildcard pattern, plus each exact pattern that exists. Nested
 // candidates owned by the same rule are pruned to the shallower one so that a
@@ -209,10 +315,11 @@ func candidates(ctx context.Context, rs []rules.Rule) []string {
 		raw = append(raw, p)
 	}
 
+ruleLoop:
 	for _, r := range rs {
 		for _, pattern := range r.PathPatterns() {
-			if err := ctx.Err(); err != nil {
-				break
+			if ctx.Err() != nil {
+				break ruleLoop
 			}
 			if !strings.Contains(pattern, "*") {
 				if _, err := os.Lstat(pattern); err == nil {
@@ -237,6 +344,9 @@ func candidates(ctx context.Context, rs []rules.Rule) []string {
 				continue
 			}
 			_ = filepath.WalkDir(base, func(p string, d os.DirEntry, err error) error {
+				if ctx.Err() != nil {
+					return filepath.SkipAll
+				}
 				if err != nil {
 					return nil
 				}
@@ -287,17 +397,30 @@ func candidates(ctx context.Context, rs []rules.Rule) []string {
 // size, and never following symlinks. A subtree claimed by a different rule is
 // not counted here: it is its own Junk Item, which is what keeps the headline
 // total free of double counting.
-func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule) (int64, []Skip, error) {
+//
+// ok is false when the item itself could not be sized (unreadable, vanished or
+// timed out); skips always carries the reason. A parent context cancellation is
+// returned as an error so the caller can stop without inventing a partial item.
+func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule, timeout time.Duration) (int64, []Skip, bool, error) {
 	var total int64
 	var skips []Skip
+	rootFailed := false
+
+	pathCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		pathCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := pathCtx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		if err != nil {
 			skips = append(skips, Skip{Path: path, Reason: ReasonFor(err)})
 			if path == root {
+				rootFailed = true
 				return filepath.SkipAll
 			}
 			return nil
@@ -313,6 +436,10 @@ func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule)
 		info, infoErr := d.Info()
 		if infoErr != nil {
 			skips = append(skips, Skip{Path: path, Reason: ReasonFor(infoErr)})
+			if path == root {
+				rootFailed = true
+				return filepath.SkipAll
+			}
 			return nil
 		}
 		if st, ok := info.Sys().(*syscall.Stat_t); ok {
@@ -322,13 +449,19 @@ func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule)
 		}
 		return nil
 	})
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return total, skips, ctxErr
+
+	if err := ctx.Err(); err != nil {
+		return total, skips, false, err
+	}
+	if pathCtx.Err() != nil {
+		skips = append(skips, Skip{Path: root, Reason: ReasonTimeout})
+		return total, skips, false, nil
 	}
 	if walkErr != nil && walkErr != filepath.SkipAll {
 		skips = append(skips, Skip{Path: root, Reason: ReasonFor(walkErr)})
+		rootFailed = true
 	}
-	return total, skips, nil
+	return total, skips, !rootFailed, nil
 }
 
 // sameRule compares the rule identity used for pruning and for partitioning a

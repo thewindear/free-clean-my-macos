@@ -75,12 +75,12 @@ func (f *fixture) addOrphan(t *testing.T, bundleID string, size int64) string {
 	return f.addCache(t, bundleID, size)
 }
 
-// addLockedCache creates a cache directory the Cleanup cannot empty, the way a
-// directory with tightened permissions behaves.
+// addLockedCache creates a cache directory the Cleanup cannot empty: it stays
+// readable so the scan can size it, but its contents cannot be unlinked.
 func (f *fixture) addLockedCache(t *testing.T, dir string) string {
 	t.Helper()
 	path := f.addCache(t, dir, 1024)
-	if err := os.Chmod(path, 0o000); err != nil {
+	if err := os.Chmod(path, 0o500); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o755) })
