@@ -94,6 +94,10 @@ func TestCancelledScanKeepsTheItemsFoundSoFar(t *testing.T) {
 	defer cancel()
 
 	opts := scanOptions(home, nil)
+	// One worker keeps the order fixed: with parallelism the two candidates are
+	// in flight at once, and "one finished before the cancel" stops being a
+	// meaningful claim.
+	opts.Jobs = 1
 	opts.Emit = func(p engine.Progress) {
 		// Cancel while the second candidate is in flight.
 		if p.Current == second {
