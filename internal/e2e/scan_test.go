@@ -82,6 +82,8 @@ type fixture struct {
 	home   string
 	caches string
 	apps   string
+	system string
+	tmp    string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -91,8 +93,10 @@ func newFixture(t *testing.T) *fixture {
 		home:   home,
 		caches: filepath.Join(home, "Library", "Caches"),
 		apps:   filepath.Join(home, "Applications"),
+		system: filepath.Join(home, "system"),
+		tmp:    filepath.Join(home, "tmp"),
 	}
-	for _, d := range []string{f.caches, f.apps} {
+	for _, d := range []string{f.caches, f.apps, f.system, f.tmp} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -108,6 +112,48 @@ func (f *fixture) addCache(t *testing.T, dir string, size int64) string {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(path, "blob.bin"), bytes.Repeat([]byte("x"), int(size)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// addPath creates a path under HOME holding one file of the given size.
+func (f *fixture) addPath(t *testing.T, rel string, size int64) string {
+	t.Helper()
+	return f.addFile(t, filepath.Join(f.home, rel), size)
+}
+
+// addSystemPath creates a path under the relocated /Library root.
+func (f *fixture) addSystemPath(t *testing.T, rel string, size int64) string {
+	t.Helper()
+	return f.addFile(t, filepath.Join(f.system, rel), size)
+}
+
+// addTempPath creates a path under the fixture TMPDIR.
+func (f *fixture) addTempPath(t *testing.T, rel string, size int64) string {
+	t.Helper()
+	return f.addFile(t, filepath.Join(f.tmp, rel), size)
+}
+
+func (f *fixture) addFile(t *testing.T, path string, size int64) string {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "blob.bin"), bytes.Repeat([]byte("x"), int(size)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// writeConfig writes a file under the tool's config directory.
+func (f *fixture) writeConfig(t *testing.T, rel, content string) string {
+	t.Helper()
+	path := filepath.Join(f.home, ".config", "free-clean-my-macos", rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -136,8 +182,9 @@ func (f *fixture) run(t *testing.T, args ...string) (stdout, stderr string, code
 	cmd := exec.Command(binary, args...)
 	cmd.Env = []string{
 		"HOME=" + f.home,
-		"TMPDIR=" + filepath.Join(f.home, "tmp") + "/",
+		"TMPDIR=" + f.tmp + "/",
 		"FCM_APPS_DIRS=" + f.apps,
+		"FCM_SYSTEM_ROOT=" + f.system,
 		"PATH=" + os.Getenv("PATH"),
 	}
 	var out, errBuf bytes.Buffer
@@ -375,4 +422,232 @@ func TestUsageErrorsExitTwo(t *testing.T) {
 			t.Errorf("%v: expected a usage message on stderr", args)
 		}
 	}
+}
+
+func TestFullRuleInventoryListsEveryPathShape(t *testing.T) {
+	f := newFixture(t)
+	f.addApp(t, "com.example.Slack", "Slack")
+
+	expected := []string{
+		f.addCache(t, "com.example.Slack", 1*1024*1024),
+		f.addCache(t, "Homebrew", 1*1024*1024),
+		f.addCache(t, "go-build", 1*1024*1024),
+		f.addCache(t, "JetBrains", 1*1024*1024),
+		f.addCache(t, "ms-playwright", 1*1024*1024),
+		f.addCache(t, "CocoaPods", 1*1024*1024),
+		f.addCache(t, "org.swift.swiftpm", 1*1024*1024),
+		f.addCache(t, "pnpm", 1*1024*1024),
+		f.addCache(t, "yarn", 1*1024*1024),
+		f.addPath(t, ".npm/_cacache", 1*1024*1024),
+		f.addPath(t, ".bun/install/cache", 1*1024*1024),
+		f.addPath(t, ".yarn/berry/cache", 1*1024*1024),
+		f.addPath(t, ".cache/pnpm", 1*1024*1024),
+		f.addPath(t, ".gradle/caches", 1*1024*1024),
+		f.addPath(t, ".m2/repository", 1*1024*1024),
+		f.addPath(t, ".cache/pip", 1*1024*1024),
+		f.addPath(t, ".cache/uv", 1*1024*1024),
+		f.addPath(t, ".cargo/registry", 1*1024*1024),
+		f.addPath(t, ".rustup/downloads", 1*1024*1024),
+		f.addPath(t, "Library/Developer/Xcode/DerivedData", 1*1024*1024),
+		f.addPath(t, "Library/Developer/CoreSimulator/Caches", 1*1024*1024),
+		f.addPath(t, "Library/Developer/Xcode/iOS DeviceSupport", 1*1024*1024),
+		f.addPath(t, "Library/Developer/Xcode/Archives", 1*1024*1024),
+		f.addPath(t, "Library/Logs/SomeApp", 1*1024*1024),
+		f.addPath(t, "Library/Logs/DiagnosticReports", 1*1024*1024),
+		f.addPath(t, "Library/Application Support/CrashReporter", 1*1024*1024),
+		f.addSystemPath(t, "Library/Caches/system.thing", 1*1024*1024),
+		f.addTempPath(t, "foo/C/blob", 1*1024*1024),
+		f.addPath(t, ".huggingface", 1*1024*1024),
+		f.addPath(t, ".cache/huggingface", 1*1024*1024),
+		f.addPath(t, "Library/Application Support/com.missing.Leftover", 1*1024*1024),
+	}
+
+	d := f.scanJSON(t)
+	if len(expected) != 31 {
+		t.Fatalf("fixture has %d paths, want 31 paths covering 30 rules", len(expected))
+	}
+	got := map[string]int{}
+	for _, o := range d.Owners {
+		for _, it := range o.Items {
+			got[it.Path]++
+		}
+	}
+	for _, path := range expected {
+		switch got[path] {
+		case 0:
+			t.Errorf("rule path %q is missing from the report", path)
+		case 1:
+			// Good: exactly one Junk Item owns it.
+		default:
+			t.Errorf("rule path %q appears %d times", path, got[path])
+		}
+	}
+	if d.Summary.Items != len(expected) {
+		t.Errorf("summary.items = %d, want %d", d.Summary.Items, len(expected))
+	}
+	if len(d.Skipped) != 0 {
+		t.Errorf("absent paths should be skipped silently, got %+v", d.Skipped)
+	}
+}
+
+func TestOverlappingRulesDoNotDoubleCount(t *testing.T) {
+	f := newFixture(t)
+	genericPath := f.addCache(t, "OtherCache", 3*1024*1024)
+	specificPath := f.addCache(t, "JetBrains", 4*1024*1024)
+
+	d := f.scanJSON(t)
+	items := allItems(d)
+	got := map[string]int64{}
+	for _, it := range items {
+		got[it.Path] = it.Size
+	}
+	for _, path := range []string{genericPath, specificPath} {
+		want := duSize(t, path)
+		if got[path] != want {
+			t.Errorf("item %q size = %d, du says %d", path, got[path], want)
+		}
+	}
+	wantTotal := duSize(t, genericPath) + duSize(t, specificPath)
+	if d.Summary.TotalBytes != wantTotal {
+		t.Errorf("summary.total_bytes = %d, want %d (sum of the two paths)", d.Summary.TotalBytes, wantTotal)
+	}
+	for _, it := range items {
+		if it.Path == f.caches {
+			t.Errorf("the generic parent directory became its own Junk Item: %q", it.Path)
+		}
+	}
+}
+
+func TestUserRuleSameNameReplacesEmbeddedRule(t *testing.T) {
+	f := newFixture(t)
+	oldPath := f.addCache(t, "go-build", 1*1024*1024)
+	newPath := f.addPath(t, "Custom/go-build", 2*1024*1024)
+	f.writeConfig(t, "rules.d/override.yaml", `
+rules:
+  - name: caches-go-build
+    pattern: ${HOME}/Custom/go-build
+    owner: Custom Toolchain
+    kind: log
+    risk: caution
+    rebuild: none
+`)
+
+	items := allItems(f.scanJSON(t))
+
+	override := itemByPath(items, newPath)
+	if override == nil {
+		t.Fatalf("override path %q is missing", newPath)
+	}
+	if override.Kind != "log" || override.Risk != "caution" || override.Rebuild != "none" {
+		t.Errorf("override item = %+v, want kind=log risk=caution rebuild=none", override)
+	}
+	if override.Recommended {
+		t.Error("a caution item must not be recommended")
+	}
+
+	old := itemByPath(items, oldPath)
+	if old == nil {
+		t.Fatalf("old path %q is missing", oldPath)
+	}
+	if old.Kind != "cache" {
+		t.Errorf("old path kind = %q, want the generic cache rule after the override", old.Kind)
+	}
+}
+
+func TestIgnoreListKeepsAPathOutOfTheReport(t *testing.T) {
+	f := newFixture(t)
+	kept := f.addCache(t, "KeepMe", 12*1024*1024)
+	visible := f.addCache(t, "Arc", 12*1024*1024)
+	f.writeConfig(t, "ignore.yaml", "ignore:\n  - ${HOME}/Library/Caches/KeepMe\n")
+
+	items := allItems(f.scanJSON(t))
+	if itemByPath(items, kept) != nil {
+		t.Errorf("ignored path %q appears in the report", kept)
+	}
+	if itemByPath(items, visible) == nil {
+		t.Errorf("non-ignored path %q is missing", visible)
+	}
+}
+
+func TestUninstalledOwnerBecomesAnOrphan(t *testing.T) {
+	f := newFixture(t)
+	path := f.addCache(t, "com.missing.Leftover", 12*1024*1024)
+
+	d := f.scanJSON(t)
+	items := allItems(d)
+	item := itemByPath(items, path)
+	if item == nil {
+		t.Fatalf("orphan path %q is missing", path)
+	}
+	if item.Kind != "orphan" {
+		t.Errorf("kind = %q, want orphan", item.Kind)
+	}
+	if item.Risk != "caution" {
+		t.Errorf("risk = %q, want caution", item.Risk)
+	}
+	if item.Recommended {
+		t.Error("an orphan must never be recommended")
+	}
+}
+
+func TestSelfExclusionHoldsAgainstUserRules(t *testing.T) {
+	f := newFixture(t)
+	state := f.addPath(t, ".local/state/free-clean-my-macos/cleanup-202511.jsonl", 12*1024*1024)
+	config := f.addPath(t, ".config/free-clean-my-macos/keep.yaml", 12*1024*1024)
+	f.addCache(t, "Arc", 12*1024*1024)
+	f.writeConfig(t, "rules.d/evil.yaml", `
+rules:
+  - name: evil-state
+    pattern: ${HOME}/.local/state/free-clean-my-macos
+    owner: Evil
+    kind: cache
+    risk: safe
+    rebuild: low
+  - name: evil-config
+    pattern: ${HOME}/.config/free-clean-my-macos
+    owner: Evil
+    kind: cache
+    risk: safe
+    rebuild: low
+`)
+
+	items := allItems(f.scanJSON(t))
+	for _, it := range items {
+		if strings.HasPrefix(it.Path, state) || strings.HasPrefix(it.Path, config) {
+			t.Errorf("self path %q appeared as a Junk Item", it.Path)
+		}
+	}
+}
+
+// --- helpers --------------------------------------------------------------
+
+func allItems(d doc) []itemDoc {
+	var out []itemDoc
+	for _, o := range d.Owners {
+		out = append(out, o.Items...)
+	}
+	return out
+}
+
+func itemByPath(items []itemDoc, path string) *itemDoc {
+	for i := range items {
+		if items[i].Path == path {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+func duSize(t *testing.T, path string) int64 {
+	t.Helper()
+	out, err := exec.Command("du", "-s", path).Output()
+	if err != nil {
+		t.Fatalf("du %s: %v", path, err)
+	}
+	fields := strings.Fields(string(out))
+	blocks, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		t.Fatalf("parsing du output %q: %v", out, err)
+	}
+	return blocks * 512
 }

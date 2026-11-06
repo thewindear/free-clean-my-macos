@@ -1,0 +1,247 @@
+# The embedded Scan Rule inventory. Patterns are full paths; ${HOME} and
+# ${TMPDIR} are the only variables. A trailing /* claims every child; ** matches
+# any number of path segments. Names are the override key: a user rule with the
+# same name replaces the entry here.
+rules:
+  - name: caches-generic
+    pattern: "${HOME}/Library/Caches/*"
+    owner: ""
+    kind: cache
+    risk: safe
+    rebuild: low
+    note: "application caches; the app rebuilds them on next use"
+
+  - name: caches-homebrew
+    pattern: "${HOME}/Library/Caches/Homebrew"
+    owner: Homebrew
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "downloaded bottles and formula metadata; rebuilt on the next install"
+
+  - name: caches-go-build
+    pattern: "${HOME}/Library/Caches/go-build"
+    owner: Go toolchain
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "compiled package cache; go rebuilds it in seconds"
+
+  - name: caches-jetbrains
+    pattern: "${HOME}/Library/Caches/JetBrains"
+    owner: JetBrains IDEs
+    kind: dev-residue
+    risk: safe
+    rebuild: high
+    note: "IDE indexes; reindexing a large project takes hours"
+
+  - name: caches-ms-playwright
+    pattern: "${HOME}/Library/Caches/ms-playwright"
+    owner: Playwright
+    kind: dev-residue
+    risk: safe
+    rebuild: high
+    note: "downloaded browser binaries; reinstalled with playwright install"
+
+  - name: caches-cocoapods
+    pattern: "${HOME}/Library/Caches/CocoaPods"
+    owner: CocoaPods
+    kind: dev-residue
+    risk: safe
+    rebuild: high
+    note: "pod specs and checkouts; re-fetched on the next pod install"
+
+  - name: caches-swiftpm
+    pattern: "${HOME}/Library/Caches/org.swift.swiftpm"
+    owner: SwiftPM
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "Swift package checkouts and artifacts"
+
+  - name: caches-pnpm
+    pattern: "${HOME}/Library/Caches/pnpm"
+    owner: pnpm
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "pnpm's shared package store cache"
+
+  - name: caches-yarn
+    pattern: "${HOME}/Library/Caches/yarn"
+    owner: Yarn
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "Yarn package metadata cache"
+
+  - name: npm-cacache
+    pattern: "${HOME}/.npm/_cacache"
+    owner: npm
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "npm's content-addressed package cache"
+
+  - name: bun-install-cache
+    pattern: "${HOME}/.bun/install/cache"
+    owner: Bun
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "Bun's downloaded package cache"
+
+  - name: yarn-berry-cache
+    pattern: "${HOME}/.yarn/berry/cache"
+    owner: Yarn Berry
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "Yarn Berry's downloaded package archive cache"
+
+  - name: pnpm-home-cache
+    pattern: "${HOME}/.cache/pnpm"
+    owner: pnpm
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "pnpm's cache outside the Library directory"
+
+  - name: gradle-caches
+    pattern: "${HOME}/.gradle/caches"
+    owner: Gradle
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "Gradle dependency and build caches"
+
+  - name: maven-repository
+    pattern: "${HOME}/.m2/repository"
+    owner: Maven
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "Maven's local artifact repository"
+
+  - name: pip-cache
+    pattern: "${HOME}/.cache/pip"
+    owner: pip
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "pip's downloaded wheel cache"
+
+  - name: uv-cache
+    pattern: "${HOME}/.cache/uv"
+    owner: uv
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "uv's downloaded package cache"
+
+  - name: cargo-registry
+    pattern: "${HOME}/.cargo/registry"
+    owner: Cargo
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "Cargo's downloaded crate registry"
+
+  - name: rustup-downloads
+    pattern: "${HOME}/.rustup/downloads"
+    owner: rustup
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "partially downloaded rustup toolchains"
+
+  - name: xcode-deriveddata
+    pattern: "${HOME}/Library/Developer/Xcode/DerivedData"
+    owner: Xcode
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "Xcode build products; rebuilt on the next build"
+
+  - name: coresimulator-caches
+    pattern: "${HOME}/Library/Developer/CoreSimulator/Caches"
+    owner: Xcode
+    kind: dev-residue
+    risk: safe
+    rebuild: low
+    note: "simulator runtime caches"
+
+  - name: xcode-ios-devicesupport
+    pattern: "${HOME}/Library/Developer/Xcode/iOS DeviceSupport"
+    owner: Xcode
+    kind: dev-residue
+    risk: safe
+    rebuild: high
+    note: "symbols copied from a device; recopied on the next debug session"
+
+  - name: xcode-archives
+    pattern: "${HOME}/Library/Developer/Xcode/Archives"
+    owner: Xcode
+    kind: dev-residue
+    risk: caution
+    rebuild: none
+    note: "archived builds; needed for App Store uploads and symbolication"
+
+  - name: logs-generic
+    pattern: "${HOME}/Library/Logs/*"
+    owner: ""
+    kind: log
+    risk: safe
+    rebuild: none
+    note: "per-app logs; new entries are written on the next launch"
+
+  - name: logs-diagnosticreports
+    pattern: "${HOME}/Library/Logs/DiagnosticReports"
+    owner: macOS
+    kind: log
+    risk: safe
+    rebuild: none
+    note: "crash and hang reports collected by macOS"
+
+  - name: crashes-crashreporter
+    pattern: "${HOME}/Library/Application Support/CrashReporter"
+    owner: macOS
+    kind: log
+    risk: safe
+    rebuild: none
+    note: "legacy crash reports collected by macOS"
+
+  - name: system-caches-generic
+    pattern: "/Library/Caches/*"
+    owner: system
+    kind: cache
+    risk: safe
+    rebuild: low
+    note: "machine-wide application caches"
+
+  - name: temp-caches
+    pattern: "${TMPDIR}**/C/*"
+    owner: system
+    kind: temp
+    risk: safe
+    rebuild: none
+    note: "per-user temporary caches"
+
+  - name: huggingface-caches
+    patterns:
+      - "${HOME}/.huggingface"
+      - "${HOME}/.cache/huggingface"
+    owner: HuggingFace
+    kind: dev-residue
+    risk: safe
+    rebuild: high
+    note: "downloaded model weights; re-downloaded on the next run"
+
+  - name: application-support-orphans
+    pattern: "${HOME}/Library/Application Support/*"
+    owner: ""
+    kind: orphan
+    risk: caution
+    rebuild: none
+    orphans_only: true
+    note: "application data left behind by an uninstalled app"

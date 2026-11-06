@@ -28,9 +28,13 @@ const usage = `fcm — whitelist-based macOS junk scanner
 
 Usage:
   fcm                      open the TUI (not built yet)
-  fcm scan [--json] [--compact]
+  fcm scan [--json] [--compact] [--rules-dir DIR]
                            scan and report, exit 3 when there is nothing to clean
   fcm help                 show this message
+
+User rules live in ~/.config/free-clean-my-macos/rules.d/*.yaml; a rule with the
+same name as an embedded one replaces it. ~/.config/free-clean-my-macos/ignore.yaml
+excludes path patterns from every scan.
 `
 
 // Run executes one command line and returns the process exit code.
@@ -57,6 +61,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit the schema v1 JSON document")
 	compact := fs.Bool("compact", false, "emit single-line JSON (implies --json)")
+	rulesDir := fs.String("rules-dir", "", "load user Scan Rules from this directory")
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
 	}
@@ -68,7 +73,12 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		*asJSON = true
 	}
 
-	report, err := engine.Scan(context.Background(), options())
+	opts, err := options(*rulesDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "fcm scan: %v\n", err)
+		return ExitPartialFailed
+	}
+	report, err := engine.Scan(context.Background(), opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "fcm scan: %v\n", err)
 		return ExitPartialFailed
@@ -175,15 +185,34 @@ func humanBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGT"[exp])
 }
 
-func options() engine.Options {
+func options(rulesDir string) (engine.Options, error) {
 	home := os.Getenv("HOME")
-	tmpdir := os.Getenv("TMPDIR")
-	return engine.Options{
-		Home:     home,
-		TmpDir:   tmpdir,
-		Rules:    rules.Default(),
-		AppsDirs: appsDirs(home),
+	configDir := filepath.Join(home, ".config", "free-clean-my-macos")
+	if rulesDir == "" {
+		rulesDir = filepath.Join(configDir, "rules.d")
 	}
+
+	userRules, err := rules.LoadDir(rulesDir)
+	if err != nil {
+		return engine.Options{}, fmt.Errorf("loading user rules: %w", err)
+	}
+	ignore, err := rules.LoadIgnore(filepath.Join(configDir, "ignore.yaml"))
+	if err != nil {
+		return engine.Options{}, fmt.Errorf("loading ignore list: %w", err)
+	}
+
+	selfBinary, _ := os.Executable()
+	return engine.Options{
+		Home:       home,
+		TmpDir:     os.Getenv("TMPDIR"),
+		Rules:      rules.Merge(rules.Default(), userRules),
+		AppsDirs:   appsDirs(home),
+		Ignore:     ignore,
+		ConfigDir:  configDir,
+		StateDir:   filepath.Join(home, ".local", "state", "free-clean-my-macos"),
+		SelfBinary: selfBinary,
+		SystemRoot: os.Getenv("FCM_SYSTEM_ROOT"),
+	}, nil
 }
 
 // appsDirs is where installed app bundles are looked up. FCM_APPS_DIRS exists
