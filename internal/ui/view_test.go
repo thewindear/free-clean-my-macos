@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/mattn/go-runewidth"
+
+	"github.com/thewindear/free-clean-my-macos/internal/clean"
 	"github.com/thewindear/free-clean-my-macos/internal/engine"
 	"github.com/thewindear/free-clean-my-macos/internal/rules"
 	"github.com/thewindear/free-clean-my-macos/internal/ui"
@@ -94,6 +96,29 @@ func TestViewFitsTheTerminal(t *testing.T) {
 			m.FinishScan(engine.Report{}, nil)
 			return m
 		}},
+		{"cleanup confirmation", func() *ui.Model {
+			m := cleanReady(t)
+			cursorOn(t, m, ownerRow("com.example.Big"))
+			expandOwnerAt(t, m)
+			m.HandleKey(ui.KeySpace) // the 6 GB item: over the threshold
+			m.HandleKey(ui.KeyClean)
+			return m
+		}},
+		{"cleanup in progress", func() *ui.Model {
+			m := cleanReady(t)
+			m.HandleKey(ui.KeyClean)
+			m.ApplyCleanEvent(clean.Event{
+				Kind: clean.EventItemStarted,
+				Item: clean.Item{Candidate: candidate("/home/Library/Caches/com.example.Slack", 12*mb, rules.RiskSafe, rules.RebuildLow)},
+			})
+			return m
+		}},
+		{"cleanup summary", func() *ui.Model {
+			m := cleanReady(t)
+			m.HandleKey(ui.KeyClean)
+			m.FinishClean(summaryResult(), nil)
+			return m
+		}},
 		{"cancelled scan", func() *ui.Model {
 			m := ui.New("/home", scanStart())
 			m.SetSize(80, 24)
@@ -143,6 +168,108 @@ func TestViewShowsTheStatsBarAndSelection(t *testing.T) {
 	m := readyModel(t)
 	view := m.View()
 	assertContains(t, view, "fcm", "6 items", "338.0 MB", "selected 1", "120.0 MB")
+}
+
+// summaryResult is a finished run with both kinds of space and one failure.
+func summaryResult() clean.Result {
+	slack := "/home/Library/Caches/com.example.Slack"
+	return clean.Result{
+		Items: []clean.Item{
+			{Candidate: candidate(slack, 12*mb, rules.RiskSafe, rules.RebuildLow), Mode: clean.ModeDelete, Outcome: clean.OutcomeDeleted},
+			{Candidate: candidate("/home/Library/Caches/com.example.Gone", 3*mb, rules.RiskCaution, rules.RebuildNone), Mode: clean.ModeTrash, Outcome: clean.OutcomeTrashed},
+			{Candidate: candidate("/home/Library/Caches/Locked", 1*mb, rules.RiskSafe, rules.RebuildLow), Mode: clean.ModeDelete, Outcome: clean.OutcomeFailed},
+		},
+		Summary: clean.Summary{
+			Items:      2,
+			FreedBytes: 12 * mb,
+			MovedBytes: 3 * mb,
+			Failed:     []clean.Failure{{Path: "/home/Library/Caches/Locked", Reason: "no-permission"}},
+			LogPath:    "/home/.local/state/free-clean-my-macos/cleanup-202607.jsonl",
+		},
+	}
+}
+
+func TestViewShowsTheConfirmation(t *testing.T) {
+	m := cleanReady(t)
+	cursorOn(t, m, ownerRow("com.example.Big"))
+	expandOwnerAt(t, m)
+	m.HandleKey(ui.KeySpace)
+	m.HandleKey(ui.KeyClean)
+
+	view := m.View()
+	assertFits(t, view, 80, 24)
+	assertContains(t, view, "Confirm Cleanup", "~/Library/Caches/com.example.Big", "6.0 GB",
+		"y confirm", "n cancel")
+}
+
+func TestViewShowsTheCleanupSummary(t *testing.T) {
+	m := cleanReady(t)
+	m.HandleKey(ui.KeyClean)
+	m.FinishClean(summaryResult(), nil)
+
+	view := m.View()
+	assertFits(t, view, 80, 24)
+	assertContains(t, view, "Cleanup Summary", "Space Freed", "12.0 MB", "Space Moved", "3.0 MB",
+		"cleanup-202607.jsonl", "no-permission", "empty the Trash in Finder")
+	if strings.Contains(view, "15.0 MB") {
+		t.Errorf("freed and moved must never be reported as one number:\n%s", view)
+	}
+}
+
+func TestViewHidesTheTrashHintWithoutSpaceMoved(t *testing.T) {
+	m := cleanReady(t)
+	m.HandleKey(ui.KeyClean)
+	result := summaryResult()
+	result.Summary.MovedBytes = 0
+	result.Summary.FreedBytes = 15 * mb
+	m.FinishClean(result, nil)
+
+	if strings.Contains(m.View(), "empty the Trash") {
+		t.Errorf("nothing was moved, so there is no Trash hint to show:\n%s", m.View())
+	}
+}
+
+func TestViewShowsTheCleanupProgress(t *testing.T) {
+	m := cleanReady(t)
+	cursorOn(t, m, ownerRow("com.example.Slack"))
+	m.HandleKey(ui.KeyEnter) // reveal the item row
+	m.HandleKey(ui.KeyClean)
+	path := "/home/Library/Caches/com.example.Slack"
+	assertContains(t, m.View(), "[·]", "cleaning") // queued, not yet started
+
+	m.ApplyCleanEvent(clean.Event{
+		Kind: clean.EventItemStarted,
+		Item: clean.Item{Candidate: candidate(path, 12*mb, rules.RiskSafe, rules.RebuildLow)},
+	})
+	view := m.View()
+	assertContains(t, view, "cleaning", "0/1", "12.0 MB", "[>]")
+
+	m.ApplyCleanEvent(clean.Event{
+		Kind:    clean.EventItemFinished,
+		Item:    clean.Item{Candidate: candidate(path, 12*mb, rules.RiskSafe, rules.RebuildLow), Outcome: clean.OutcomeDeleted},
+		Summary: clean.Summary{Items: 1, FreedBytes: 12 * mb},
+	})
+	assertContains(t, m.View(), "1/1", "[✓]")
+}
+
+func TestViewShowsAFailedItemInTheList(t *testing.T) {
+	m := cleanReady(t)
+	cursorOn(t, m, ownerRow("com.example.Slack"))
+	m.HandleKey(ui.KeyEnter)
+	m.HandleKey(ui.KeyClean)
+	path := "/home/Library/Caches/com.example.Slack"
+	assertContains(t, m.View(), "[·]", "cleaning") // queued, not yet started
+
+	m.ApplyCleanEvent(clean.Event{
+		Kind: clean.EventItemFinished,
+		Item: clean.Item{
+			Candidate: candidate(path, 12*mb, rules.RiskSafe, rules.RebuildLow),
+			Outcome:   clean.OutcomeFailed,
+			Error:     "permission denied",
+		},
+		Summary: clean.Summary{Failed: []clean.Failure{{Path: path, Reason: "no-permission"}}},
+	})
+	assertContains(t, m.View(), "[!]")
 }
 
 func TestViewShowsKeyHints(t *testing.T) {

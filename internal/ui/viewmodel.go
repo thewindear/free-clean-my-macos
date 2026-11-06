@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thewindear/free-clean-my-macos/internal/clean"
 	"github.com/thewindear/free-clean-my-macos/internal/engine"
 	"github.com/thewindear/free-clean-my-macos/internal/format"
 	"github.com/thewindear/free-clean-my-macos/internal/rules"
@@ -34,6 +35,9 @@ const (
 	ActionNone Action = iota
 	ActionQuit
 	ActionCancelScan
+	// ActionClean asks the shell to run the Cleanup the model has prepared and
+	// can hand back through CleanPaths.
+	ActionClean
 )
 
 // Key is one normalized key press. The shell translates terminal input into
@@ -55,6 +59,10 @@ const (
 	KeyToggleAll   Key = "A"
 	KeyFilter      Key = "/"
 	KeyDetail      Key = "d"
+	KeyClean       Key = "c"
+
+	KeyConfirm Key = "y"
+	KeyDecline Key = "n"
 )
 
 // Check is the checkbox state of a row: for an item it is selected or not, for
@@ -88,6 +96,9 @@ type Row struct {
 	Size      int64
 	Count     int // RowFold: how many Junk Items are folded in
 	Check     Check
+	// State is how the Cleanup is getting on with this item, for RowItem rows
+	// only; the empty value means "never cleaned in this session".
+	State ItemState
 }
 
 // Stats is the stats bar: what the scan found and what is selected right now.
@@ -101,7 +112,34 @@ type Stats struct {
 	SelectedBytes int64
 	Current       string // the absolute path being sized, while scanning
 	Notice        string // "scan cancelled", "scan failed: ...", or empty
+
+	// The Cleanup Progress counter, live while a Cleanup runs.
+	Cleaning        bool
+	CleanItems      int
+	CleanCount      int
+	CleanBytes      int64
+	CleanTotalBytes int64
 }
+
+// ItemState is how the Cleanup is getting on with one Junk Item.
+type ItemState string
+
+const (
+	StatePending    ItemState = "pending"
+	StateInProgress ItemState = "in-progress"
+	StateDone       ItemState = "done"
+	StateFailed     ItemState = "failed"
+)
+
+// overlay is which modal panel is up, if any.
+type overlay int
+
+const (
+	overlayNone overlay = iota
+	overlayDetail
+	overlayConfirm
+	overlaySummary
+)
 
 // Detail is the modal panel a `d` press opens: labelled facts about one row.
 type Detail struct {
@@ -135,9 +173,27 @@ type Model struct {
 
 	query   string
 	editing bool
-	detail  bool
+	overlay overlay
 	cursor  int
 	scroll  int
+
+	// The Cleanup: what the gate is asking about, what the shell is running,
+	// and what happened to each Junk Item.
+	confirmation Confirmation
+	pending      []clean.Candidate
+	cleaning     bool
+	states       map[string]ItemState
+	failures     map[string]string
+	cleanup      CleanupProgress
+	result       *clean.Result
+}
+
+// CleanupProgress is the live "how far has the Cleanup got" counter.
+type CleanupProgress struct {
+	Items      int   // finished, successfully or not
+	Count      int   // in this run
+	Bytes      int64 // bytes of the items that finished successfully
+	TotalBytes int64 // bytes selected for this run
 }
 
 // New starts a Model in the scanning phase. home is only used to shorten paths
@@ -152,6 +208,8 @@ func New(home string, startedAt time.Time) *Model {
 		selected:  map[string]bool{},
 		expanded:  map[string]bool{},
 		unfolded:  map[string]bool{},
+		states:    map[string]ItemState{},
+		failures:  map[string]string{},
 	}
 }
 
@@ -190,7 +248,7 @@ func (m *Model) FinishScan(report engine.Report, err error) {
 	m.report = report
 	m.phase = PhaseReady
 	m.elapsed = time.Duration(report.DurationMS) * time.Millisecond
-	m.query, m.editing, m.detail = "", false, false
+	m.query, m.editing, m.overlay = "", false, overlayNone
 	m.cursor, m.scroll = 0, 0
 	m.progress = engine.Progress{
 		Items:   report.Summary.Items,
@@ -232,36 +290,18 @@ func (m *Model) HandleKey(k Key) Action {
 	}
 
 	if m.editing {
-		switch k {
-		case KeyEsc:
-			m.query, m.editing, m.cursor, m.scroll = "", false, 0, 0
-		case KeyEnter:
-			m.editing = false
-		case KeyBackspace:
-			if r := []rune(m.query); len(r) > 0 {
-				m.query = string(r[:len(r)-1])
-			}
-			m.cursor, m.scroll = 0, 0
-		case KeySpace:
-			m.query += " "
-			m.cursor, m.scroll = 0, 0
-		default:
-			// Everything else that is a single character is text; named keys
-			// (up, home, ...) are not.
-			if runes := []rune(k); len(runes) == 1 {
-				m.query += string(runes)
-				m.cursor, m.scroll = 0, 0
-			}
-		}
+		m.handleFilterKey(k)
 		return ActionNone
 	}
 
-	if m.detail {
-		switch k {
-		case KeyEsc, KeyEnter, KeyDetail:
-			m.detail = false
-		}
+	switch m.overlay {
+	case overlayDetail:
+		m.handleDetailKey(k)
 		return ActionNone
+	case overlayConfirm:
+		return m.handleConfirmKey(k)
+	case overlaySummary:
+		return m.handleSummaryKey(k)
 	}
 
 	if m.phase == PhaseScanning {
@@ -271,6 +311,75 @@ func (m *Model) HandleKey(k Key) Action {
 		return ActionNone
 	}
 
+	return m.handleListKey(k)
+}
+
+// handleFilterKey types into the filter. esc clears it and restores the list;
+// enter keeps it applied.
+func (m *Model) handleFilterKey(k Key) {
+	switch k {
+	case KeyEsc:
+		m.query, m.editing, m.cursor, m.scroll = "", false, 0, 0
+	case KeyEnter:
+		m.editing = false
+	case KeyBackspace:
+		if r := []rune(m.query); len(r) > 0 {
+			m.query = string(r[:len(r)-1])
+		}
+		m.cursor, m.scroll = 0, 0
+	case KeySpace:
+		m.query += " "
+		m.cursor, m.scroll = 0, 0
+	default:
+		// Everything else that is a single character is text; named keys
+		// (up, home, ...) are not.
+		if runes := []rune(k); len(runes) == 1 {
+			m.query += string(runes)
+			m.cursor, m.scroll = 0, 0
+		}
+	}
+}
+
+func (m *Model) handleDetailKey(k Key) {
+	switch k {
+	case KeyEsc, KeyEnter, KeyDetail:
+		m.overlay = overlayNone
+	}
+}
+
+// handleConfirmKey answers the gate. Nothing has been removed yet, so declining
+// costs nothing; confirming is the only way the Cleanup starts.
+func (m *Model) handleConfirmKey(k Key) Action {
+	switch k {
+	case KeyConfirm, KeyEnter:
+		m.overlay = overlayNone
+		pending := m.confirmation.Items
+		m.confirmation = Confirmation{}
+		m.beginClean(pending)
+		return ActionClean
+	case KeyDecline, KeyEsc:
+		m.overlay = overlayNone
+		m.confirmation = Confirmation{}
+		m.pending = nil
+		m.notice = "cleanup cancelled — nothing was removed"
+	}
+	return ActionNone
+}
+
+// handleSummaryKey closes the Summary; `c` is the retry the Summary itself
+// offers, so it closes the panel and starts the failed items again.
+func (m *Model) handleSummaryKey(k Key) Action {
+	switch k {
+	case KeyEsc, KeyEnter, KeyDetail:
+		m.overlay = overlayNone
+	case KeyClean:
+		m.overlay = overlayNone
+		return m.startClean()
+	}
+	return ActionNone
+}
+
+func (m *Model) handleListKey(k Key) Action {
 	switch k {
 	case KeyEsc:
 		// esc backs out of the filter before it does anything else.
@@ -301,10 +410,180 @@ func (m *Model) HandleKey(k Key) Action {
 		m.editing = true
 	case KeyDetail:
 		if _, ok := m.focused(); ok {
-			m.detail = true
+			m.overlay = overlayDetail
 		}
+	case KeyClean:
+		return m.startClean()
 	}
 	return ActionNone
+}
+
+// startClean is `c`: clean what is selected, unless the gate needs an answer
+// first.
+func (m *Model) startClean() Action {
+	if m.cleaning {
+		return ActionNone
+	}
+	selected := m.selectedCandidates()
+	if len(selected) == 0 {
+		m.notice = "nothing selected — check some Junk Items first"
+		return ActionNone
+	}
+
+	// The TUI has no Permanent Delete mode of its own yet; when it grows one,
+	// this is the flag that gates it.
+	if confirmation := Confirm(selected, false); confirmation.Required {
+		m.confirmation = confirmation
+		m.overlay = overlayConfirm
+		return ActionNone
+	}
+
+	m.beginClean(selected)
+	return ActionClean
+}
+
+// beginClean puts every selected item in the pending state and remembers the
+// order the shell should work through.
+func (m *Model) beginClean(selected []clean.Candidate) {
+	m.cleaning = true
+	m.notice = ""
+	m.pending = append([]clean.Candidate(nil), selected...)
+	m.cleanup = CleanupProgress{Count: len(selected)}
+	for _, c := range selected {
+		// Items cleaned by an earlier run keep their Outcome: a retry only
+		// resets the rows it is about to touch.
+		m.states[c.Path] = StatePending
+		delete(m.failures, c.Path)
+		m.cleanup.TotalBytes += c.Size
+	}
+}
+
+// selectedCandidates is the Selection as Cleanup input, ordered largest first
+// the way the Cleanup Log and the progress list read best.
+func (m *Model) selectedCandidates() []clean.Candidate {
+	var out []clean.Candidate
+	for _, c := range clean.Select(m.report, nil) {
+		if m.selected[c.Path] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Cleaning reports whether a Cleanup is running.
+func (m *Model) Cleaning() bool { return m.cleaning }
+
+// PendingCandidates is the ordered selection the shell should hand to the
+// Cleanup: the exact Junk Items the user confirmed, with the sizes they saw.
+func (m *Model) PendingCandidates() []clean.Candidate {
+	if len(m.pending) == 0 {
+		return nil
+	}
+	return append([]clean.Candidate(nil), m.pending...)
+}
+
+// CleanPaths is PendingCandidates as absolute paths, which is what a test or a
+// log line wants to read.
+func (m *Model) CleanPaths() []string {
+	if len(m.pending) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m.pending))
+	for _, c := range m.pending {
+		out = append(out, c.Path)
+	}
+	return out
+}
+
+// PendingConfirmation is the gate's content while the confirmation overlay is
+// up.
+func (m *Model) PendingConfirmation() (Confirmation, bool) {
+	if m.overlay != overlayConfirm {
+		return Confirmation{}, false
+	}
+	return m.confirmation, true
+}
+
+// CleanState is how the Cleanup got on with one Junk Item.
+func (m *Model) CleanState(path string) (ItemState, bool) {
+	state, ok := m.states[path]
+	return state, ok
+}
+
+// CleanFailure is the reason a Junk Item failed.
+func (m *Model) CleanFailure(path string) string { return m.failures[path] }
+
+// ApplyCleanEvent moves one row through pending -> in-progress -> done or
+// failed. The counters are the Cleanup's own Summary, so the screen never
+// derives a byte total of its own.
+func (m *Model) ApplyCleanEvent(ev clean.Event) {
+	if !m.cleaning {
+		return
+	}
+	switch ev.Kind {
+	case clean.EventItemStarted:
+		m.states[ev.Item.Path] = StateInProgress
+	case clean.EventItemFinished:
+		if ev.Item.Outcome == clean.OutcomeFailed {
+			m.states[ev.Item.Path] = StateFailed
+			m.failures[ev.Item.Path] = ev.Item.Error
+		} else {
+			m.states[ev.Item.Path] = StateDone
+		}
+		m.cleanup.Items = ev.Summary.Items + len(ev.Summary.Failed)
+		m.cleanup.Bytes = ev.Summary.FreedBytes + ev.Summary.MovedBytes
+	}
+}
+
+// FinishClean adopts the run's Result: successes leave the Selection, failures
+// stay selected so pressing `c` again retries exactly them, and the Summary
+// explains what happened.
+func (m *Model) FinishClean(result clean.Result, err error) {
+	m.cleaning = false
+	if err != nil {
+		// The run never started, so the rows go back to how they were and the
+		// selection stays put for another attempt.
+		for _, c := range m.pending {
+			delete(m.states, c.Path)
+		}
+		m.pending = nil
+		m.cleanup = CleanupProgress{}
+		m.notice = "cleanup failed: " + err.Error()
+		return
+	}
+
+	for _, it := range result.Items {
+		if it.Outcome == clean.OutcomeFailed {
+			m.states[it.Path] = StateFailed
+			m.failures[it.Path] = it.Error
+			continue
+		}
+		m.states[it.Path] = StateDone
+		delete(m.selected, it.Path)
+	}
+	m.pending = nil
+	m.cleanup = CleanupProgress{
+		Items:      len(result.Items),
+		Count:      len(result.Items),
+		Bytes:      result.Summary.FreedBytes + result.Summary.MovedBytes,
+		TotalBytes: result.Summary.FreedBytes + result.Summary.MovedBytes,
+	}
+	if len(result.Summary.Failed) > 0 {
+		m.notice = format.Count(len(result.Summary.Failed), "failure") + " — press c to retry"
+	} else {
+		m.notice = "cleanup complete"
+	}
+	m.result = &result
+	m.overlay = overlaySummary
+}
+
+// CleanSummary is the Summary overlay's content: Space Freed and Space Moved
+// kept apart, the failures with reasons, and the Cleanup Log path.
+func (m *Model) CleanSummary() (clean.Result, bool) {
+	if m.overlay != overlaySummary || m.result == nil {
+		return clean.Result{}, false
+	}
+	return *m.result, true
 }
 
 // Rows is the visible list: every Owner, expanded into its Junk Items when it
@@ -349,6 +628,7 @@ func (m *Model) Rows() []Row {
 				Label:     it.Path,
 				Size:      it.Size,
 				Check:     checkOf(m.selected[it.Path]),
+				State:     m.states[it.Path],
 			})
 		}
 		if len(folded) > 0 {
@@ -401,6 +681,11 @@ func (m *Model) Stats() Stats {
 		s.Skipped = len(m.report.Skipped)
 	}
 	s.SelectedItems, s.SelectedBytes = m.Selection()
+	s.Cleaning = m.cleaning
+	s.CleanItems = m.cleanup.Items
+	s.CleanCount = m.cleanup.Count
+	s.CleanBytes = m.cleanup.Bytes
+	s.CleanTotalBytes = m.cleanup.TotalBytes
 	return s
 }
 
@@ -421,7 +706,7 @@ func (m *Model) Selection() (items int, bytes int64) {
 // Detail is the modal panel's content for the focused row, and whether the
 // panel is open at all.
 func (m *Model) Detail() (Detail, bool) {
-	if !m.detail {
+	if m.overlay != overlayDetail {
 		return Detail{}, false
 	}
 	row, ok := m.focused()

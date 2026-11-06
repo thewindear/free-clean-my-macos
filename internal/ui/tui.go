@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-isatty"
 
+	"github.com/thewindear/free-clean-my-macos/internal/clean"
 	"github.com/thewindear/free-clean-my-macos/internal/engine"
 )
 
@@ -28,9 +29,10 @@ func Supported() bool {
 
 // Run opens the list screen and returns when the user quits. The scan runs in
 // the background, so the screen is responsive — and cancellable — from the
-// first frame.
-func Run(stdout io.Writer, opts engine.Options) error {
-	p := tea.NewProgram(newScreen(opts), tea.WithOutput(stdout), tea.WithAltScreen())
+// first frame; a Cleanup runs in the background too, so the per-item progress
+// is visible while it happens.
+func Run(stdout io.Writer, scan engine.Options, cleanup clean.Options) error {
+	p := tea.NewProgram(newScreen(scan, cleanup), tea.WithOutput(stdout), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
@@ -45,26 +47,43 @@ type scanDoneMsg struct {
 	err    error
 }
 
+// cleanEventMsg carries one Cleanup event: an item started or finished.
+type cleanEventMsg clean.Event
+
+// cleanDoneMsg is the terminal message of a Cleanup: the Result, and the reason
+// it could not start if it could not.
+type cleanDoneMsg struct {
+	result clean.Result
+	err    error
+}
+
 // tickMsg advances the live elapsed time.
 type tickMsg time.Time
 
 // screen is the Bubble Tea shell: it translates terminal input into Keys and
-// engine events into model calls, and owns the scan's context.
+// engine events into model calls, and owns the scan's context and the
+// goroutines that do the work.
 type screen struct {
-	model  *Model
-	opts   engine.Options
+	model   *Model
+	scan    engine.Options
+	cleanup clean.Options
+
+	// msgs is the one channel every worker writes to: the scan's progress, the
+	// Cleanup's events, and both terminal results. It is never closed, because
+	// the scan and the Cleanup are separate lifetimes.
 	msgs   chan tea.Msg
 	quit   chan struct{}
 	cancel context.CancelFunc
 	closed bool
 }
 
-func newScreen(opts engine.Options) *screen {
+func newScreen(scan engine.Options, cleanup clean.Options) *screen {
 	return &screen{
-		model: New(opts.Home, time.Now()),
-		opts:  opts,
-		msgs:  make(chan tea.Msg, 64),
-		quit:  make(chan struct{}),
+		model:   New(scan.Home, time.Now()),
+		scan:    scan,
+		cleanup: cleanup,
+		msgs:    make(chan tea.Msg, 64),
+		quit:    make(chan struct{}),
 	}
 }
 
@@ -80,7 +99,7 @@ func (s *screen) startScan() {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 
-	opts := s.opts
+	opts := s.scan
 	var lastEmit time.Time
 	opts.Emit = func(p engine.Progress) {
 		if !lastEmit.IsZero() && time.Since(lastEmit) < progressInterval {
@@ -101,17 +120,43 @@ func (s *screen) startScan() {
 		case s.msgs <- scanDoneMsg{report: report, err: err}:
 		case <-s.quit:
 		}
-		close(s.msgs)
 	}()
 }
 
-// readMsg waits for the next engine message.
+// startClean runs the Cleanup of what the model prepared. It is only called
+// when the model asked for it, so the selection has already passed the gate.
+func (s *screen) startClean() {
+	selected := s.model.PendingCandidates()
+	if len(selected) == 0 {
+		return
+	}
+	opts := s.cleanup
+	opts.Emit = func(ev clean.Event) {
+		// Blocking on purpose: a dropped finished event would make a row lie
+		// about what happened. The buffer and the reader keep up in practice.
+		select {
+		case s.msgs <- cleanEventMsg(ev):
+		case <-s.quit:
+		}
+	}
+	go func() {
+		result, err := clean.Run(context.Background(), selected, opts)
+		select {
+		case s.msgs <- cleanDoneMsg{result: result, err: err}:
+		case <-s.quit:
+		}
+	}()
+}
+
+// readMsg waits for the next worker message. It gives up when the program
+// quits, so no reader goroutine outlives the screen.
 func (s *screen) readMsg() tea.Msg {
-	msg, ok := <-s.msgs
-	if !ok {
+	select {
+	case msg := <-s.msgs:
+		return msg
+	case <-s.quit:
 		return nil
 	}
-	return msg
 }
 
 // tick asks for the next elapsed-time update.
@@ -126,7 +171,7 @@ func (s *screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 
 	case tea.KeyMsg:
-		switch action := s.model.HandleKey(keyOf(msg)); action {
+		switch s.model.HandleKey(keyOf(msg)) {
 		case ActionQuit:
 			s.shutdown()
 			return s, tea.Quit
@@ -134,26 +179,30 @@ func (s *screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if s.cancel != nil {
 				s.cancel()
 			}
+		case ActionClean:
+			s.startClean()
 		}
-		return s, nil
 
 	case progressMsg:
 		s.model.ApplyProgress(engine.Progress(msg))
-		return s, s.readMsg
 
 	case scanDoneMsg:
 		s.cancel = nil
 		s.model.FinishScan(msg.report, msg.err)
-		return s, nil
+
+	case cleanEventMsg:
+		s.model.ApplyCleanEvent(clean.Event(msg))
+
+	case cleanDoneMsg:
+		s.model.FinishClean(msg.result, msg.err)
 
 	case tickMsg:
 		s.model.Tick(time.Time(msg))
 		if s.model.Stats().Phase == PhaseScanning {
-			return s, tick()
+			return s, tea.Batch(s.readMsg, tick())
 		}
-		return s, nil
 	}
-	return s, nil
+	return s, s.readMsg
 }
 
 func (s *screen) View() string { return s.model.View() }

@@ -27,8 +27,8 @@ const sizeColumn = 10
 // the key hints. It is a pure function of the model and the terminal size, so
 // it renders correctly over SSH and in a test.
 func (m *Model) View() string {
-	if m.detail {
-		return m.detailView()
+	if m.overlay != overlayNone {
+		return m.panelView()
 	}
 	return m.listView()
 }
@@ -98,8 +98,27 @@ func (m *Model) rowLine(row Row) string {
 	if row.Kind == RowItem {
 		label = format.Home(m.home, row.Path)
 	}
-	left := fmt.Sprintf("%s %s %s", prefix, m.checkMark(row.Check), label)
+	mark := m.checkMark(row.Check)
+	if row.State != "" {
+		mark = stateMark(row.State)
+	}
+	left := fmt.Sprintf("%s %s %s", prefix, mark, label)
 	return rightAlign(left, format.Bytes(row.Size), m.width)
+}
+
+// stateMark is the Cleanup Progress glyph for one Junk Item: queued, being
+// removed, removed, or failed.
+func stateMark(state ItemState) string {
+	switch state {
+	case StateInProgress:
+		return "[>]"
+	case StateDone:
+		return "[✓]"
+	case StateFailed:
+		return "[!]"
+	default:
+		return "[·]"
+	}
 }
 
 // checkMark is the row's checkbox: an Owner can also read as partly selected.
@@ -134,6 +153,10 @@ func (m *Model) statsBar() string {
 // filter in progress, or the notice from a cancelled scan.
 func (m *Model) statusLine() string {
 	switch {
+	case m.cleaning:
+		return fmt.Sprintf("cleaning  %d/%d · %s of %s",
+			m.cleanup.Items, m.cleanup.Count,
+			format.Bytes(m.cleanup.Bytes), format.Bytes(m.cleanup.TotalBytes))
 	case m.editing:
 		return "filter: " + m.query + "_"
 	case m.query != "":
@@ -152,10 +175,12 @@ func (m *Model) hintLine() string {
 	switch {
 	case m.editing:
 		return "enter apply · esc clear"
+	case m.cleaning:
+		return "cleaning… q quits, the Cleanup Log keeps what happened"
 	case m.phase == PhaseScanning:
 		return "esc cancel scan · q quit"
 	default:
-		return "space toggle · enter fold · a owner · A all · / filter · d detail · q quit"
+		return "space toggle · a owner · A all · / filter · d detail · c clean · q quit"
 	}
 }
 
@@ -171,33 +196,30 @@ func (m *Model) emptyState() string {
 	}
 }
 
-// detailView is the modal panel `d` opens. It replaces the list while it is up,
-// keeping the stats bar and a one-line key hint.
-func (m *Model) detailView() string {
-	detail, ok := m.Detail()
+// panelView is the modal panel overlay: the Detail, the confirmation gate or
+// the Cleanup Summary. It replaces the list while it is up, keeping the stats
+// bar and a one-line key hint.
+func (m *Model) panelView() string {
+	p, ok := m.panelFor()
 	if !ok {
 		return m.listView()
 	}
-	lines := []string{m.statsBar()}
-	lines = append(lines, detail.Title, strings.Repeat("─", maxInt(0, minInt(m.width, 60))))
+	lines := []string{m.statsBar(), p.Title, strings.Repeat("─", maxInt(0, minInt(m.width, 60)))}
 
-	const labelWidth = 13
+	const labelWidth = 15
 	valueWidth := maxInt(1, m.width-labelWidth-1)
-	for _, f := range detail.Fields {
+	for _, f := range p.Fields {
 		wrapped := wrapCells(f.Value, valueWidth)
 		lines = append(lines, pad(f.Label, labelWidth)+" "+wrapped[0])
 		for _, extra := range wrapped[1:] {
 			lines = append(lines, strings.Repeat(" ", labelWidth+1)+extra)
 		}
 	}
-	lines = append(lines, "", "esc close")
+	lines = append(lines, "", p.Hint)
 
-	// Never overflow the terminal: drop trailing content lines if the panel is
-	// taller than the screen, keeping the hint line.
-	if len(lines) > m.height && m.height >= 2 {
-		keep := append([]string{}, lines[:m.height-1]...)
-		keep[len(keep)-1] = "esc close"
-		lines = keep
+	// Never overflow the terminal.
+	if max := maxInt(2, m.height); len(lines) > max {
+		lines = append(lines[:max-2], "…", p.Hint)
 	}
 	for i, line := range lines {
 		lines[i] = pad(line, m.width)

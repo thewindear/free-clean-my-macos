@@ -87,11 +87,27 @@ func runList(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "fcm: %v\n", err)
 		return ExitPartialFailed
 	}
-	if err := ui.Run(stdout, opts); err != nil {
+	if err := ui.Run(stdout, opts, cleanOptions("", false)); err != nil {
 		fmt.Fprintf(stderr, "fcm: %v\n", err)
 		return ExitPartialFailed
 	}
 	return ExitOK
+}
+
+// cleanOptions is where a Cleanup puts what it removes and logs what it did. The
+// CLI passes its flags in; the list screen uses the defaults, so both paths
+// write to the same Trash and the same Cleanup Log.
+func cleanOptions(trashDir string, dryRun bool) clean.Options {
+	home := os.Getenv("HOME")
+	trash := trashDir
+	if trash == "" {
+		trash = filepath.Join(home, ".Trash")
+	}
+	return clean.Options{
+		TrashDir: trash,
+		StateDir: stateDir(home),
+		DryRun:   dryRun,
+	}
 }
 
 func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -204,17 +220,7 @@ func runClean(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return ExitPartialFailed
 	}
 
-	home := os.Getenv("HOME")
-	trash := *trashDir
-	if trash == "" {
-		trash = filepath.Join(home, ".Trash")
-	}
-	result, err := clean.Run(ctx, report, clean.Options{
-		TrashDir:  trash,
-		StateDir:  stateDir(home),
-		DryRun:    *dryRun,
-		OnlyKinds: kinds,
-	})
+	result, err := clean.Run(ctx, clean.Select(report, kinds), cleanOptions(*trashDir, *dryRun))
 	if err != nil {
 		fmt.Fprintf(stderr, "fcm clean: %v\n", err)
 		return ExitPartialFailed
