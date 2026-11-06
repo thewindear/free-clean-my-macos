@@ -45,6 +45,8 @@ type itemDoc struct {
 	Risk        string `json:"risk"`
 	Rebuild     string `json:"rebuild"`
 	Recommended bool   `json:"recommended"`
+	Rule        string `json:"rule"`
+	Note        string `json:"note"`
 }
 
 type ownerDoc struct {
@@ -246,6 +248,12 @@ func TestScanJSONDocumentShape(t *testing.T) {
 			if it.Kind != "cache" {
 				t.Errorf("item %q kind = %q, want cache", it.Path, it.Kind)
 			}
+			if it.Rule == "" {
+				t.Errorf("item %q does not name the Scan Rule that claimed it", it.Path)
+			}
+			if it.Note == "" {
+				t.Errorf("item %q has no rule explanation", it.Path)
+			}
 		}
 	}
 	found := false
@@ -406,10 +414,27 @@ func TestEmptyScanExitsThree(t *testing.T) {
 	}
 }
 
+// TestBareFcmWithoutATerminalExitsTwo keeps a script from hanging: the list
+// screen needs keys, so without a terminal fcm points at the scriptable path
+// instead of starting a UI nobody can drive.
+func TestBareFcmWithoutATerminalExitsTwo(t *testing.T) {
+	f := newFixture(t)
+	f.addApp(t, "com.example.Slack", "Slack")
+	f.addCache(t, "com.example.Slack", 12*1024*1024)
+
+	_, stderr, code := f.run(t)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 without a terminal (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stderr, "terminal") || !strings.Contains(stderr, "fcm scan --json") {
+		t.Errorf("stderr should explain why and offer the scriptable path, got %q", stderr)
+	}
+}
+
 func TestUsageErrorsExitTwo(t *testing.T) {
 	f := newFixture(t)
 	for _, args := range [][]string{
-		{},                                 // bare fcm: the TUI does not exist yet
+		{},                                 // bare fcm: no terminal in this harness
 		{"nonsense"},                       // unknown subcommand
 		{"scan", "--nonsense"},             // unknown flag
 		{"scan", "--compact-without-json"}, // unknown flag

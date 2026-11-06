@@ -44,7 +44,29 @@ type Options struct {
 
 	Now     func() time.Time
 	Running func(ownerID string) bool
+
+	// Emit receives Scan Progress as the scan runs, so a consumer can show a
+	// live stats bar instead of a frozen screen. It is called from the scanning
+	// goroutine: it must be cheap, must not block, and must not call back into
+	// the engine.
+	Emit func(Progress)
 }
+
+// Progress is the live Scan Progress: how much has been sized so far and which
+// path is in flight right now. Items and Bytes are cumulative and never shrink,
+// so a stats bar built from them never jumps backwards.
+type Progress struct {
+	Items   int
+	Bytes   int64
+	Skipped int
+	Current string
+}
+
+// FoldBelow is the size under which a listing folds a Junk Item into one
+// "other N items" row instead of giving it a row, so the list stays readable at
+// 200+ entries. It is the same 10 MB as Recommended's floor: an item that is
+// not worth recommending is not worth a row either.
+const FoldBelow int64 = 10 * 1024 * 1024
 
 // Item is one Junk Item.
 type Item struct {
@@ -54,6 +76,11 @@ type Item struct {
 	Risk        rules.Risk    `json:"risk"`
 	Rebuild     rules.Rebuild `json:"rebuild"`
 	Recommended bool          `json:"recommended"`
+	// Rule and Note are the Scan Rule that claimed this path and its one-line
+	// human explanation, so a detail view can explain why the item is listed
+	// without matching rules a second time.
+	Rule string `json:"rule"`
+	Note string `json:"note,omitempty"`
 }
 
 // Owner is an Owner together with its Junk Items.
@@ -102,7 +129,9 @@ const (
 	ReasonError        = "error"
 )
 
-// Scan walks the rule set and returns the Report.
+// Scan walks the rule set and returns the Report. With Options.Emit set it also
+// streams Scan Progress as it goes. A cancelled scan returns the partial Report
+// together with the cancellation, so a consumer can still show what it found.
 func Scan(ctx context.Context, opts Options) (Report, error) {
 	started := time.Now()
 	if opts.Now != nil {
@@ -126,9 +155,11 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 	}
 
 	byID := map[string]*Owner{}
+	var progress Progress
+	var scanErr error
 	for _, candidate := range candidates(ctx, expanded) {
-		if err := ctx.Err(); err != nil {
-			return report, err
+		if scanErr = ctx.Err(); scanErr != nil {
+			break
 		}
 		if excluded(candidate, protected) || rules.Ignored(candidate, ignore) {
 			continue
@@ -148,11 +179,19 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		}
 		running := opts.Running(res.ID)
 
+		// Announce what is about to be sized, then size it: a du of a 32 GB
+		// directory takes seconds, so the path on screen has to be the current
+		// one, not the last finished one.
+		progress.Current = candidate
+		progress.Skipped = len(report.Skipped)
+		emit(opts, progress)
+
 		size, skips, err := duBytes(ctx, candidate, rule, expanded)
-		if err != nil {
-			return report, err
-		}
 		report.Skipped = append(report.Skipped, skips...)
+		if err != nil {
+			scanErr = err
+			break
+		}
 
 		item := Item{
 			Path:        candidate,
@@ -161,6 +200,8 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 			Risk:        risk,
 			Rebuild:     rule.Rebuild,
 			Recommended: Recommended(risk, rule.Rebuild, running, res.Recognized, size),
+			Rule:        rule.Name,
+			Note:        rule.Note,
 		}
 
 		o, ok := byID[res.ID]
@@ -170,8 +211,19 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		}
 		o.Items = append(o.Items, item)
 		o.Total += size
+
+		progress.Items++
+		progress.Bytes += size
+		progress.Skipped = len(report.Skipped)
 	}
 
+	// One last event so a stats bar lands on the final numbers even if the
+	// consumer ignores the Report that follows.
+	progress.Current = ""
+	emit(opts, progress)
+
+	// Finalize even a cancelled scan: the list screen shows what was sized
+	// before the cancel instead of an empty screen.
 	for _, o := range byID {
 		sort.Slice(o.Items, func(i, j int) bool { return o.Items[i].Size > o.Items[j].Size })
 		report.Owners = append(report.Owners, *o)
@@ -191,7 +243,14 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		elapsed = opts.Now().Sub(started)
 	}
 	report.DurationMS = elapsed.Milliseconds()
-	return report, nil
+	return report, scanErr
+}
+
+// emit hands one Progress to the consumer when there is one.
+func emit(opts Options, p Progress) {
+	if opts.Emit != nil {
+		opts.Emit(p)
+	}
 }
 
 // candidates lists every path the rule set could claim: the children matched

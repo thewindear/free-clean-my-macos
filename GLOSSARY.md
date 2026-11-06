@@ -95,6 +95,18 @@ _Avoid_: 黑名单
 Live feedback while scanning — items visited and bytes found so far — cancelled with a single key.
 _Avoid_: 加载中
 
+**Selection**（勾选集合）:
+The Junk Items currently checked, with a live count and byte total. The sizes are the engine's; the list only sums them.
+_Avoid_: 选中列表
+
+**Fold**（折叠）:
+Replacing the Junk Items under 10 MB of one Owner with a single "N other items" row so the list stays readable. Folding never changes the Selection: the row stands for its Junk Items.
+_Avoid_: 聚合, 合并
+
+**Detail**（详情）:
+The panel one Junk Item or Owner opens into: the Scan Rule that matched, what its Risk Level and Rebuild Cost mean, and the absolute path.
+_Avoid_: 属性页
+
 **Cleanup Progress**（清理进度）:
 Per-Junk-Item outcome (pending / done / failed) plus an overall byte counter. Since Trash moves are near-instant, this is a checklist rather than a slow bar.
 _Avoid_: 进度条

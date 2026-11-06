@@ -3,8 +3,9 @@ package engine
 import "github.com/thewindear/free-clean-my-macos/internal/rules"
 
 // tenMB is the size floor below which an item is folded away rather than
-// recommended: deleting it wins nothing worth the decision.
-const tenMB int64 = 10 * 1024 * 1024
+// recommended: deleting it wins nothing worth the decision. It is the same
+// number as FoldBelow because both answer the same question.
+const tenMB = FoldBelow
 
 // Recommended reports whether a Junk Item is pre-checked for the user. It is
 // the engine's single source of truth for the checkboxes; the UI never

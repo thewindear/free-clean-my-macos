@@ -1,5 +1,5 @@
-// Command fcm scans a Mac for junk that is provably safe to delete and, later,
-// cleans it.
+// Command fcm finds junk a Scan Rule declared safe to delete, shows it as a
+// list, and cleans what the user selects.
 package main
 
 import (
