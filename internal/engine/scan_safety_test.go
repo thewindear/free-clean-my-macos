@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,8 +26,10 @@ func TestScanCancellationReturnsAPartialReport(t *testing.T) {
 
 	report, err := engine.Scan(ctx, scanOptions(home, nil))
 	cancel()
-	if err != nil {
-		t.Fatalf("cancelled Scan returned an error: %v", err)
+	// A cancelled scan returns what it sized *and* says why it stopped, so a
+	// consumer can tell "cancelled" apart from "finished".
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Scan returned %v, want context.Canceled", err)
 	}
 	if ctx.Err() == nil {
 		t.Fatal("the test never cancelled the scan")

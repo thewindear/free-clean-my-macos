@@ -53,6 +53,35 @@ type Options struct {
 
 	Now     func() time.Time
 	Running func(owner.Owner) bool
+
+	// Emit receives Scan Progress as the scan runs, so a consumer can show a
+	// live stats bar instead of a frozen screen. It is called from the scanning
+	// goroutine: it must be cheap, must not block, and must not call back into
+	// the engine.
+	Emit func(Progress)
+}
+
+// Progress is the live Scan Progress: how much has been sized so far and which
+// path is in flight right now. Items and Bytes are cumulative and never shrink,
+// so a stats bar built from them never jumps backwards.
+type Progress struct {
+	Items   int
+	Bytes   int64
+	Skipped int
+	Current string
+}
+
+// FoldBelow is the size under which a listing folds a Junk Item into one
+// "other N items" row instead of giving it a row, so the list stays readable at
+// 200+ entries. It is the same 10 MB as Recommended's floor: an item that is
+// not worth recommending is not worth a row either.
+const FoldBelow int64 = 10 * 1024 * 1024
+
+// emit hands one Progress to the consumer when there is one.
+func emit(opts Options, p Progress) {
+	if opts.Emit != nil {
+		opts.Emit(p)
+	}
 }
 
 // Item is one Junk Item.
@@ -63,6 +92,12 @@ type Item struct {
 	Risk        rules.Risk    `json:"risk"`
 	Rebuild     rules.Rebuild `json:"rebuild"`
 	Recommended bool          `json:"recommended"`
+
+	// Rule and Note are the Scan Rule that claimed this path and its one-line
+	// human explanation, so a detail view can explain why the item is listed
+	// without matching rules a second time.
+	Rule string `json:"rule"`
+	Note string `json:"note,omitempty"`
 }
 
 // Owner is an Owner together with its Junk Items.
@@ -174,7 +209,16 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		tasks = append(tasks, sizeTask{path: candidate, rule: rule, own: res, kind: kind, risk: risk})
 	}
 
-	results := sizeAll(ctx, opts, expanded, tasks)
+	var progress Progress
+	var scanErr error
+	results := sizeAll(ctx, opts, expanded, tasks, func(path string) {
+		progress.Current = path
+		progress.Skipped = len(report.Skipped)
+		emit(opts, progress)
+	})
+	if err := ctx.Err(); err != nil {
+		scanErr = err
+	}
 	byID := map[string]*Owner{}
 	for i, r := range results {
 		report.Skipped = append(report.Skipped, r.skips...)
@@ -189,6 +233,8 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 			Risk:        t.risk,
 			Rebuild:     t.rule.Rebuild,
 			Recommended: Recommended(t.risk, t.rule.Rebuild, false, t.own.Recognized, r.size),
+			Rule:        t.rule.Name,
+			Note:        t.rule.Note,
 		}
 
 		o, ok := byID[t.own.ID]
@@ -198,6 +244,12 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		}
 		o.Items = append(o.Items, item)
 		o.Total += r.size
+
+		progress.Current = t.path
+		progress.Items++
+		progress.Bytes += r.size
+		progress.Skipped = len(report.Skipped)
+		emit(opts, progress)
 	}
 
 	for _, o := range byID {
@@ -219,7 +271,13 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		elapsed = opts.Now().Sub(started)
 	}
 	report.DurationMS = elapsed.Milliseconds()
-	return report, nil
+
+	// One last event so a stats bar lands on the final numbers even if the
+	// consumer ignores the Report that follows. A cancelled scan still returns
+	// what it sized, plus the cancellation.
+	progress.Current = ""
+	emit(opts, progress)
+	return report, scanErr
 }
 
 type sizeTask struct {
@@ -239,7 +297,7 @@ type sizeResult struct {
 
 // sizeAll walks candidates with bounded parallelism. Owners were resolved
 // before this point, so the resolver is never shared across goroutines.
-func sizeAll(ctx context.Context, opts Options, rs []rules.Rule, tasks []sizeTask) []sizeResult {
+func sizeAll(ctx context.Context, opts Options, rs []rules.Rule, tasks []sizeTask, onStart func(string)) []sizeResult {
 	results := make([]sizeResult, len(tasks))
 	if len(tasks) == 0 {
 		return results
@@ -272,6 +330,9 @@ func sizeAll(ctx context.Context, opts Options, rs []rules.Rule, tasks []sizeTas
 					return
 				}
 				t := tasks[i]
+				if onStart != nil {
+					onStart(t.path)
+				}
 				size, skips, ok, err := duBytes(ctx, t.path, t.rule, rs, opts.PathTimeout)
 				if err != nil {
 					if ctx.Err() != nil {

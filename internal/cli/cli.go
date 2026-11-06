@@ -17,8 +17,10 @@ import (
 
 	"github.com/thewindear/free-clean-my-macos/internal/clean"
 	"github.com/thewindear/free-clean-my-macos/internal/engine"
+	"github.com/thewindear/free-clean-my-macos/internal/format"
 	"github.com/thewindear/free-clean-my-macos/internal/owner"
 	"github.com/thewindear/free-clean-my-macos/internal/rules"
+	"github.com/thewindear/free-clean-my-macos/internal/ui"
 )
 
 // Exit codes.
@@ -32,7 +34,7 @@ const (
 const usage = `fcm — whitelist-based macOS junk scanner
 
 Usage:
-  fcm                      open the TUI (not built yet)
+  fcm                      open the list screen
   fcm scan [--json] [--compact] [--rules-dir DIR] [--jobs N]
                            scan and report, exit 3 when there is nothing to clean
   fcm clean --dry-run [--json] [--only-kind cache,log] [--jobs N]
@@ -55,8 +57,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "fcm: the TUI is not built yet; run `fcm scan --json`")
-		return ExitUsage
+		return runList(stdout, stderr)
 	}
 
 	switch args[0] {
@@ -71,6 +72,26 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "fcm: unknown command %q\n\n%s", args[0], usage)
 		return ExitUsage
 	}
+}
+
+// runList opens the list screen. Without a terminal there is no way to read a
+// keypress, so fcm says so and points at the scriptable commands instead of
+// hanging or printing escape codes into a pipe.
+func runList(stdout, stderr io.Writer) int {
+	if !ui.Supported() {
+		fmt.Fprintln(stderr, "fcm: the list screen needs a terminal; use `fcm scan --json` or `fcm clean`")
+		return ExitUsage
+	}
+	opts, err := options("", 0)
+	if err != nil {
+		fmt.Fprintf(stderr, "fcm: %v\n", err)
+		return ExitPartialFailed
+	}
+	if err := ui.Run(stdout, opts); err != nil {
+		fmt.Fprintf(stderr, "fcm: %v\n", err)
+		return ExitPartialFailed
+	}
+	return ExitOK
 }
 
 func runScan(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -225,11 +246,11 @@ func writeCleanText(w io.Writer, result clean.Result) {
 		verb = "Would clean"
 	}
 	total := result.Summary.FreedBytes + result.Summary.MovedBytes
-	fmt.Fprintf(w, "%s %d items · %s\n\n", verb, len(result.Items), humanBytes(total))
+	fmt.Fprintf(w, "%s %d items · %s\n\n", verb, len(result.Items), format.Bytes(total))
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, it := range result.Items {
-		fmt.Fprintf(tw, "  %s\t%s\t%s\n", outcomeLabel(it), abbreviateHome(it.Path), humanBytes(it.Size))
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n", outcomeLabel(it), abbreviateHome(it.Path), format.Bytes(it.Size))
 	}
 	tw.Flush()
 
@@ -237,7 +258,7 @@ func writeCleanText(w io.Writer, result clean.Result) {
 	if result.DryRun {
 		freed, moved = freed+" (planned)", moved+" (planned)"
 	}
-	fmt.Fprintf(w, "\n%s  %s\n%s  %s\n", freed, humanBytes(result.Summary.FreedBytes), moved, humanBytes(result.Summary.MovedBytes))
+	fmt.Fprintf(w, "\n%s  %s\n%s  %s\n", freed, format.Bytes(result.Summary.FreedBytes), moved, format.Bytes(result.Summary.MovedBytes))
 
 	if len(result.Summary.Failed) > 0 {
 		fmt.Fprintf(w, "\n%d failed:\n", len(result.Summary.Failed))
@@ -281,16 +302,16 @@ func parseKinds(list string) ([]rules.Kind, error) {
 }
 
 func writeText(w io.Writer, report engine.Report) {
-	total := humanBytes(report.Summary.TotalBytes)
+	total := format.Bytes(report.Summary.TotalBytes)
 	fmt.Fprintf(w, "Scanned %d items in %dms · %s reclaimable · %d skipped\n\n",
 		report.Summary.Items, report.DurationMS, total, len(report.Skipped))
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, o := range report.Owners {
-		fmt.Fprintf(tw, "  %s\t%s\t%s\n", ownerLabel(o), humanBytes(o.Total), plural(len(o.Items), "item"))
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n", ownerLabel(o), format.Bytes(o.Total), format.Count(len(o.Items), "item"))
 		folded, foldedBytes := 0, int64(0)
 		for _, it := range o.Items {
-			if it.Size < foldBelow {
+			if it.Size < engine.FoldBelow {
 				folded++
 				foldedBytes += it.Size
 				continue
@@ -299,10 +320,10 @@ func writeText(w io.Writer, report engine.Report) {
 			if it.Recommended {
 				mark = "✓"
 			}
-			fmt.Fprintf(tw, "    %s %s\t%s\t%s\n", mark, abbreviateHome(it.Path), humanBytes(it.Size), it.Kind)
+			fmt.Fprintf(tw, "    %s %s\t%s\t%s\n", mark, abbreviateHome(it.Path), format.Bytes(it.Size), it.Kind)
 		}
 		if folded > 0 {
-			fmt.Fprintf(tw, "      %s\t%s\tfolded\n", plural(folded, "smaller item"), humanBytes(foldedBytes))
+			fmt.Fprintf(tw, "      %s\t%s\tfolded\n", format.Count(folded, "smaller item"), format.Bytes(foldedBytes))
 		}
 	}
 	tw.Flush()
@@ -311,10 +332,6 @@ func writeText(w io.Writer, report engine.Report) {
 		fmt.Fprintf(w, "  skipped %s (%s)\n", abbreviateHome(s.Path), s.Reason)
 	}
 }
-
-// foldBelow is the size under which items are folded into one row instead of
-// being listed individually.
-const foldBelow int64 = 10 * 1024 * 1024
 
 // ownerLabel names an Owner for humans: a resolved display name plus its bundle
 // id, or the raw directory name flagged as unrecognized.
@@ -329,33 +346,10 @@ func ownerLabel(o engine.Owner) string {
 	}
 }
 
-func plural(n int, word string) string {
-	if n == 1 {
-		return fmt.Sprintf("%d %s", n, word)
-	}
-	return fmt.Sprintf("%d %ss", n, word)
-}
-
-// abbreviateHome is the Display Path: $HOME shown as ~ to fit the listing.
+// abbreviateHome is the Display Path, with HOME taken from the environment for
+// the text listings.
 func abbreviateHome(path string) string {
-	home := os.Getenv("HOME")
-	if home != "" && strings.HasPrefix(path, home+"/") {
-		return "~" + strings.TrimPrefix(path, home)
-	}
-	return path
-}
-
-func humanBytes(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit && exp < 3; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGT"[exp])
+	return format.Home(os.Getenv("HOME"), path)
 }
 
 func options(rulesDir string, jobs int) (engine.Options, error) {
