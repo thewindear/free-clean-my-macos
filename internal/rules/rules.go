@@ -48,6 +48,19 @@ const (
 	KindOrphan     Kind = "orphan"
 )
 
+// validKinds is the closed set of Kind values a rule or a selection may use.
+var validKinds = map[Kind]bool{
+	KindCache:      true,
+	KindLog:        true,
+	KindDevResidue: true,
+	KindTemp:       true,
+	KindOrphan:     true,
+}
+
+// ValidKind reports whether k is a Kind the domain defines, so the CLI can
+// reject a typo instead of silently selecting nothing.
+func ValidKind(k Kind) bool { return validKinds[k] }
+
 // Rule is one declarative Scan Rule. Paths are written as full paths with
 // ${HOME} / ${TMPDIR} variables; a trailing /* claims every child directory,
 // and ** matches any number of path segments.

@@ -5,6 +5,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -294,7 +296,7 @@ func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule)
 			return ctxErr
 		}
 		if err != nil {
-			skips = append(skips, Skip{Path: path, Reason: reasonFor(err)})
+			skips = append(skips, Skip{Path: path, Reason: ReasonFor(err)})
 			if path == root {
 				return filepath.SkipAll
 			}
@@ -310,7 +312,7 @@ func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule)
 		}
 		info, infoErr := d.Info()
 		if infoErr != nil {
-			skips = append(skips, Skip{Path: path, Reason: reasonFor(infoErr)})
+			skips = append(skips, Skip{Path: path, Reason: ReasonFor(infoErr)})
 			return nil
 		}
 		if st, ok := info.Sys().(*syscall.Stat_t); ok {
@@ -324,7 +326,7 @@ func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule)
 		return total, skips, ctxErr
 	}
 	if walkErr != nil && walkErr != filepath.SkipAll {
-		skips = append(skips, Skip{Path: root, Reason: reasonFor(walkErr)})
+		skips = append(skips, Skip{Path: root, Reason: ReasonFor(walkErr)})
 	}
 	return total, skips, nil
 }
@@ -419,11 +421,11 @@ func relocateLibrary(pattern, root string) string {
 	return filepath.Join(root, pattern)
 }
 
-func reasonFor(err error) string {
+func ReasonFor(err error) string {
 	switch {
-	case os.IsPermission(err):
+	case errors.Is(err, fs.ErrPermission):
 		return ReasonNoPermission
-	case os.IsNotExist(err):
+	case errors.Is(err, fs.ErrNotExist):
 		return ReasonVanished
 	default:
 		return ReasonError
