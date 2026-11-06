@@ -34,6 +34,19 @@ const (
 	KindOrphan     Kind = "orphan"
 )
 
+// validKinds is the closed set of Kind values a rule or a selection may use.
+var validKinds = map[Kind]bool{
+	KindCache:      true,
+	KindLog:        true,
+	KindDevResidue: true,
+	KindTemp:       true,
+	KindOrphan:     true,
+}
+
+// ValidKind reports whether k is a Kind the domain defines, so the CLI can
+// reject a typo instead of silently selecting nothing.
+func ValidKind(k Kind) bool { return validKinds[k] }
+
 // Rule is one declarative Scan Rule. Pattern is written as a full path with
 // ${HOME} / ${TMPDIR} variables; a trailing /* claims every child directory.
 type Rule struct {
@@ -47,6 +60,9 @@ type Rule struct {
 
 // Default is the built-in rule set. This tracer bullet ships the application
 // caches scope only; the full inventory arrives with its own ticket.
+//
+// The rebuild cost matters for the Cleanup, not for the scan: a rule that
+// declares it high is always moved into the Trash rather than deleted.
 func Default() []Rule {
 	return []Rule{
 		{

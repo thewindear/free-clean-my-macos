@@ -5,6 +5,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -214,7 +216,7 @@ func duBytes(ctx context.Context, root string) (int64, []Skip, error) {
 			return ctxErr
 		}
 		if err != nil {
-			skips = append(skips, Skip{Path: path, Reason: reasonFor(err)})
+			skips = append(skips, Skip{Path: path, Reason: ReasonFor(err)})
 			if path == root {
 				return filepath.SkipAll
 			}
@@ -222,7 +224,7 @@ func duBytes(ctx context.Context, root string) (int64, []Skip, error) {
 		}
 		info, infoErr := d.Info()
 		if infoErr != nil {
-			skips = append(skips, Skip{Path: path, Reason: reasonFor(infoErr)})
+			skips = append(skips, Skip{Path: path, Reason: ReasonFor(infoErr)})
 			return nil
 		}
 		if st, ok := info.Sys().(*syscall.Stat_t); ok {
@@ -236,16 +238,18 @@ func duBytes(ctx context.Context, root string) (int64, []Skip, error) {
 		return total, skips, ctxErr
 	}
 	if walkErr != nil && walkErr != filepath.SkipAll {
-		skips = append(skips, Skip{Path: root, Reason: reasonFor(walkErr)})
+		skips = append(skips, Skip{Path: root, Reason: ReasonFor(walkErr)})
 	}
 	return total, skips, nil
 }
 
-func reasonFor(err error) string {
+// ReasonFor classifies a filesystem error as one of the reason constants above,
+// so the scan and the Cleanup describe the same failure the same way.
+func ReasonFor(err error) string {
 	switch {
-	case os.IsPermission(err):
+	case errors.Is(err, fs.ErrPermission):
 		return ReasonNoPermission
-	case os.IsNotExist(err):
+	case errors.Is(err, fs.ErrNotExist):
 		return ReasonVanished
 	default:
 		return ReasonError

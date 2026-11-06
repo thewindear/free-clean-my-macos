@@ -57,6 +57,14 @@ _Avoid_: 忽略, 过滤
 Removing the selected Junk Items — `risk=safe` + `rebuild_cost=low` items are deleted outright, everything else is moved into the Trash so it stays recoverable.
 _Avoid_: 删除, 清除
 
+**Removal Mode**（移除方式）:
+How one Junk Item leaves the disk during a Cleanup: `delete` (outright, counted toward Space Freed) or `trash` (moved, counted toward Space Moved). Derived from Risk Level and Rebuild Cost by the hybrid policy — it is not a per-item user choice; Permanent Delete is the only override.
+_Avoid_: 删除方式, mode（无限定词）
+
+**Outcome**（结果）:
+What actually happened to one Junk Item: `planned` in a dry run, then `deleted`, `trashed` or `failed`. Every item gets exactly one Outcome and exactly one Cleanup Log record.
+_Avoid_: 状态, 结果状态
+
 **Space Freed**（已释放）:
 Bytes actually reclaimed — only items deleted outright count. Moving into the Trash frees nothing until the Trash is emptied.
 _Avoid_: 已清理空间
