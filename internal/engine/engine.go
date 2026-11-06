@@ -9,8 +9,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,8 +44,15 @@ type Options struct {
 	// a fixture so process-boundary tests never read the real /Library.
 	SystemRoot string
 
+	// PathTimeout bounds one Junk Item's size walk. Zero means the product
+	// default of 30 seconds.
+	PathTimeout time.Duration
+
+	// Jobs bounds the size walk. Zero means min(8, NumCPU/2).
+	Jobs int
+
 	Now     func() time.Time
-	Running func(ownerID string) bool
+	Running func(owner.Owner) bool
 
 	// Emit receives Scan Progress as the scan runs, so a consumer can show a
 	// live stats bar instead of a frozen screen. It is called from the scanning
@@ -68,6 +77,13 @@ type Progress struct {
 // not worth recommending is not worth a row either.
 const FoldBelow int64 = 10 * 1024 * 1024
 
+// emit hands one Progress to the consumer when there is one.
+func emit(opts Options, p Progress) {
+	if opts.Emit != nil {
+		opts.Emit(p)
+	}
+}
+
 // Item is one Junk Item.
 type Item struct {
 	Path        string        `json:"path"`
@@ -76,6 +92,7 @@ type Item struct {
 	Risk        rules.Risk    `json:"risk"`
 	Rebuild     rules.Rebuild `json:"rebuild"`
 	Recommended bool          `json:"recommended"`
+
 	// Rule and Note are the Scan Rule that claimed this path and its one-line
 	// human explanation, so a detail view can explain why the item is listed
 	// without matching rules a second time.
@@ -129,16 +146,22 @@ const (
 	ReasonError        = "error"
 )
 
-// Scan walks the rule set and returns the Report. With Options.Emit set it also
-// streams Scan Progress as it goes. A cancelled scan returns the partial Report
-// together with the cancellation, so a consumer can still show what it found.
+const (
+	defaultPathTimeout = 30 * time.Second
+	tempMaxAge         = 7 * 24 * time.Hour
+)
+
+// Scan walks the rule set and returns the Report.
 func Scan(ctx context.Context, opts Options) (Report, error) {
 	started := time.Now()
 	if opts.Now != nil {
 		started = opts.Now()
 	}
 	if opts.Running == nil {
-		opts.Running = func(string) bool { return false }
+		opts.Running = func(owner.Owner) bool { return false }
+	}
+	if opts.PathTimeout <= 0 {
+		opts.PathTimeout = defaultPathTimeout
 	}
 
 	expanded := applySystemRoot(rules.ExpandAll(opts.Rules, opts.Home, opts.TmpDir), opts.SystemRoot)
@@ -154,11 +177,9 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		Summary:   Summary{Failed: []string{}},
 	}
 
-	byID := map[string]*Owner{}
-	var progress Progress
-	var scanErr error
+	var tasks []sizeTask
 	for _, candidate := range candidates(ctx, expanded) {
-		if scanErr = ctx.Err(); scanErr != nil {
+		if ctx.Err() != nil {
 			break
 		}
 		if excluded(candidate, protected) || rules.Ignored(candidate, ignore) {
@@ -173,57 +194,64 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		if rule.OrphansOnly && !res.Orphan {
 			continue
 		}
+		if opts.Running(res) {
+			report.Skipped = append(report.Skipped, Skip{Path: candidate, Reason: ReasonRunning})
+			continue
+		}
+		if rule.Kind == rules.KindTemp && !olderThan(candidate, started, tempMaxAge) {
+			continue
+		}
+
 		kind, risk := rule.Kind, rule.Risk
 		if res.Orphan {
 			kind, risk = rules.KindOrphan, rules.RiskCaution
 		}
-		running := opts.Running(res.ID)
-
-		// Announce what is about to be sized, then size it: a du of a 32 GB
-		// directory takes seconds, so the path on screen has to be the current
-		// one, not the last finished one.
-		progress.Current = candidate
-		progress.Skipped = len(report.Skipped)
-		emit(opts, progress)
-
-		size, skips, err := duBytes(ctx, candidate, rule, expanded)
-		report.Skipped = append(report.Skipped, skips...)
-		if err != nil {
-			scanErr = err
-			break
-		}
-
-		item := Item{
-			Path:        candidate,
-			Size:        size,
-			Kind:        kind,
-			Risk:        risk,
-			Rebuild:     rule.Rebuild,
-			Recommended: Recommended(risk, rule.Rebuild, running, res.Recognized, size),
-			Rule:        rule.Name,
-			Note:        rule.Note,
-		}
-
-		o, ok := byID[res.ID]
-		if !ok {
-			o = &Owner{ID: res.ID, Name: res.Name, Running: running, Items: []Item{}}
-			byID[res.ID] = o
-		}
-		o.Items = append(o.Items, item)
-		o.Total += size
-
-		progress.Items++
-		progress.Bytes += size
-		progress.Skipped = len(report.Skipped)
+		tasks = append(tasks, sizeTask{path: candidate, rule: rule, own: res, kind: kind, risk: risk})
 	}
 
-	// One last event so a stats bar lands on the final numbers even if the
-	// consumer ignores the Report that follows.
-	progress.Current = ""
-	emit(opts, progress)
+	var progress Progress
+	var scanErr error
+	results := sizeAll(ctx, opts, expanded, tasks, func(path string) {
+		progress.Current = path
+		progress.Skipped = len(report.Skipped)
+		emit(opts, progress)
+	})
+	if err := ctx.Err(); err != nil {
+		scanErr = err
+	}
+	byID := map[string]*Owner{}
+	for i, r := range results {
+		report.Skipped = append(report.Skipped, r.skips...)
+		if !r.done || !r.ok {
+			continue
+		}
+		t := tasks[i]
+		item := Item{
+			Path:        t.path,
+			Size:        r.size,
+			Kind:        t.kind,
+			Risk:        t.risk,
+			Rebuild:     t.rule.Rebuild,
+			Recommended: Recommended(t.risk, t.rule.Rebuild, false, t.own.Recognized, r.size),
+			Rule:        t.rule.Name,
+			Note:        t.rule.Note,
+		}
 
-	// Finalize even a cancelled scan: the list screen shows what was sized
-	// before the cancel instead of an empty screen.
+		o, ok := byID[t.own.ID]
+		if !ok {
+			o = &Owner{ID: t.own.ID, Name: t.own.Name, Items: []Item{}}
+			byID[t.own.ID] = o
+		}
+		o.Items = append(o.Items, item)
+		o.Total += r.size
+
+		progress.Current = t.path
+		progress.Items++
+		progress.Bytes += r.size
+		progress.Skipped = len(report.Skipped)
+		emit(opts, progress)
+	}
+
 	for _, o := range byID {
 		sort.Slice(o.Items, func(i, j int) bool { return o.Items[i].Size > o.Items[j].Size })
 		report.Owners = append(report.Owners, *o)
@@ -243,14 +271,94 @@ func Scan(ctx context.Context, opts Options) (Report, error) {
 		elapsed = opts.Now().Sub(started)
 	}
 	report.DurationMS = elapsed.Milliseconds()
+
+	// One last event so a stats bar lands on the final numbers even if the
+	// consumer ignores the Report that follows. A cancelled scan still returns
+	// what it sized, plus the cancellation.
+	progress.Current = ""
+	emit(opts, progress)
 	return report, scanErr
 }
 
-// emit hands one Progress to the consumer when there is one.
-func emit(opts Options, p Progress) {
-	if opts.Emit != nil {
-		opts.Emit(p)
+type sizeTask struct {
+	path string
+	rule rules.Rule
+	own  owner.Owner
+	kind rules.Kind
+	risk rules.Risk
+}
+
+type sizeResult struct {
+	done  bool
+	ok    bool
+	size  int64
+	skips []Skip
+}
+
+// sizeAll walks candidates with bounded parallelism. Owners were resolved
+// before this point, so the resolver is never shared across goroutines.
+func sizeAll(ctx context.Context, opts Options, rs []rules.Rule, tasks []sizeTask, onStart func(string)) []sizeResult {
+	results := make([]sizeResult, len(tasks))
+	if len(tasks) == 0 {
+		return results
 	}
+
+	jobs := opts.Jobs
+	if jobs <= 0 {
+		jobs = runtime.NumCPU() / 2
+	}
+	if jobs < 1 {
+		jobs = 1
+	}
+	if jobs > 8 {
+		jobs = 8
+	}
+
+	index := make(chan int, len(tasks))
+	for i := range tasks {
+		index <- i
+	}
+	close(index)
+
+	var wg sync.WaitGroup
+	for w := 0; w < jobs; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range index {
+				if ctx.Err() != nil {
+					return
+				}
+				t := tasks[i]
+				if onStart != nil {
+					onStart(t.path)
+				}
+				size, skips, ok, err := duBytes(ctx, t.path, t.rule, rs, opts.PathTimeout)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					skips = append(skips, Skip{Path: t.path, Reason: ReasonError})
+					results[i] = sizeResult{done: true, skips: skips}
+					continue
+				}
+				results[i] = sizeResult{done: true, ok: ok, size: size, skips: skips}
+			}
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+// olderThan reports whether a temp-scope candidate is old enough to consider.
+// A path that cannot be inspected is left to the sizer, which records the
+// appropriate skip reason.
+func olderThan(path string, now time.Time, age time.Duration) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return true
+	}
+	return info.ModTime().Before(now.Add(-age))
 }
 
 // candidates lists every path the rule set could claim: the children matched
@@ -268,10 +376,11 @@ func candidates(ctx context.Context, rs []rules.Rule) []string {
 		raw = append(raw, p)
 	}
 
+ruleLoop:
 	for _, r := range rs {
 		for _, pattern := range r.PathPatterns() {
-			if err := ctx.Err(); err != nil {
-				break
+			if ctx.Err() != nil {
+				break ruleLoop
 			}
 			if !strings.Contains(pattern, "*") {
 				if _, err := os.Lstat(pattern); err == nil {
@@ -296,6 +405,9 @@ func candidates(ctx context.Context, rs []rules.Rule) []string {
 				continue
 			}
 			_ = filepath.WalkDir(base, func(p string, d os.DirEntry, err error) error {
+				if ctx.Err() != nil {
+					return filepath.SkipAll
+				}
 				if err != nil {
 					return nil
 				}
@@ -346,17 +458,30 @@ func candidates(ctx context.Context, rs []rules.Rule) []string {
 // size, and never following symlinks. A subtree claimed by a different rule is
 // not counted here: it is its own Junk Item, which is what keeps the headline
 // total free of double counting.
-func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule) (int64, []Skip, error) {
+//
+// ok is false when the item itself could not be sized (unreadable, vanished or
+// timed out); skips always carries the reason. A parent context cancellation is
+// returned as an error so the caller can stop without inventing a partial item.
+func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule, timeout time.Duration) (int64, []Skip, bool, error) {
 	var total int64
 	var skips []Skip
+	rootFailed := false
+
+	pathCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		pathCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := pathCtx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		if err != nil {
 			skips = append(skips, Skip{Path: path, Reason: ReasonFor(err)})
 			if path == root {
+				rootFailed = true
 				return filepath.SkipAll
 			}
 			return nil
@@ -372,6 +497,10 @@ func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule)
 		info, infoErr := d.Info()
 		if infoErr != nil {
 			skips = append(skips, Skip{Path: path, Reason: ReasonFor(infoErr)})
+			if path == root {
+				rootFailed = true
+				return filepath.SkipAll
+			}
 			return nil
 		}
 		if st, ok := info.Sys().(*syscall.Stat_t); ok {
@@ -381,13 +510,19 @@ func duBytes(ctx context.Context, root string, rule rules.Rule, rs []rules.Rule)
 		}
 		return nil
 	})
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return total, skips, ctxErr
+
+	if err := ctx.Err(); err != nil {
+		return total, skips, false, err
+	}
+	if pathCtx.Err() != nil {
+		skips = append(skips, Skip{Path: root, Reason: ReasonTimeout})
+		return total, skips, false, nil
 	}
 	if walkErr != nil && walkErr != filepath.SkipAll {
 		skips = append(skips, Skip{Path: root, Reason: ReasonFor(walkErr)})
+		rootFailed = true
 	}
-	return total, skips, nil
+	return total, skips, !rootFailed, nil
 }
 
 // sameRule compares the rule identity used for pruning and for partitioning a

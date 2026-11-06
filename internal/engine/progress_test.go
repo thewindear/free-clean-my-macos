@@ -8,22 +8,7 @@ import (
 	"testing"
 
 	"github.com/thewindear/free-clean-my-macos/internal/engine"
-	"github.com/thewindear/free-clean-my-macos/internal/rules"
 )
-
-// scanOptions builds a scan over a fixture HOME and nothing else: every
-// absolute path the rule set would read from the real machine is relocated.
-func scanOptions(home string) engine.Options {
-	return engine.Options{
-		Home:       home,
-		TmpDir:     filepath.Join(home, "tmp"),
-		Rules:      rules.Default(),
-		AppsDirs:   []string{filepath.Join(home, "Applications")},
-		SystemRoot: filepath.Join(home, "system"),
-		ConfigDir:  filepath.Join(home, ".config", "free-clean-my-macos"),
-		StateDir:   filepath.Join(home, ".local", "state", "free-clean-my-macos"),
-	}
-}
 
 // addCache writes one cache directory of the given size into a fixture HOME.
 func addCache(t *testing.T, home, name string, size int64) string {
@@ -47,7 +32,7 @@ func TestScanEmitsProgressForEveryItem(t *testing.T) {
 	second := addCache(t, home, "com.example.Slack", 3*1024*1024)
 
 	var events []engine.Progress
-	opts := scanOptions(home)
+	opts := scanOptions(home, nil)
 	opts.Emit = func(p engine.Progress) { events = append(events, p) }
 
 	report, err := engine.Scan(context.Background(), opts)
@@ -82,7 +67,7 @@ func TestProgressCountsAreCumulative(t *testing.T) {
 	addCache(t, home, "Arc", 2*1024*1024)
 	addCache(t, home, "com.example.Slack", 3*1024*1024)
 
-	opts := scanOptions(home)
+	opts := scanOptions(home, nil)
 	items, totals := 0, int64(0)
 	opts.Emit = func(p engine.Progress) {
 		if p.Items < items || p.Bytes < totals {
@@ -108,7 +93,7 @@ func TestCancelledScanKeepsTheItemsFoundSoFar(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	opts := scanOptions(home)
+	opts := scanOptions(home, nil)
 	opts.Emit = func(p engine.Progress) {
 		// Cancel while the second candidate is in flight.
 		if p.Current == second {
@@ -137,7 +122,7 @@ func TestItemCarriesItsMatchedRule(t *testing.T) {
 	home := t.TempDir()
 	addCache(t, home, "Arc", 2*1024*1024)
 
-	report, err := engine.Scan(context.Background(), scanOptions(home))
+	report, err := engine.Scan(context.Background(), scanOptions(home, nil))
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}

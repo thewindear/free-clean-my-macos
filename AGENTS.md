@@ -23,3 +23,13 @@ Single-context: `GLOSSARY.md` at the repo root plus `docs/adr/`. See `docs/agent
 - **Safety rules** (from `docs/adr/0001-*` and `0003-*`): never request Full Disk Access, never call sudo, never follow symlinks while sizing, and never let a test write inside the real `~/Library` or the real Trash.
 - **Tests live at two seams**: the process boundary (build `fcm`, run it with `HOME` / `FCM_APPS_DIRS` pointed at a fixture) and pure functions (rule precedence, recommendation policy). No tests against internals.
 - **Before committing**: `gofmt -l .` (must be empty), `go vet ./...`, `go test -count=1 ./...`. The `-count=1` matters: the process-boundary tests exec a freshly built binary, which Go's test cache cannot see.
+
+## Landing a ticket
+
+Tickets are worked on branches in separate `git worktree`s; `main` must be green after every landing.
+
+```bash
+./scripts/land-ticket.sh ticket/04-safety 4 --expect 'internal/engine/*:internal/owner/*'
+```
+
+The script merges with `--no-ff`, runs `go test -count=1 ./...`, pushes, and closes the issue. It **stops** on a conflict (aborting the merge) and **rolls `main` back** if the tests are red, so `main` is never left broken. Conflicts and red tests are judgement calls; the script refuses to guess.

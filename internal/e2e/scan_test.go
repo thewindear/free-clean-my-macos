@@ -3,12 +3,14 @@ package e2e_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	// Blank imports keep the test cache honest: these tests exercise the
 	// freshly built binary, so a change here must invalidate the cached pass.
@@ -86,6 +88,7 @@ type fixture struct {
 	apps   string
 	system string
 	tmp    string
+	env    map[string]string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -97,6 +100,7 @@ func newFixture(t *testing.T) *fixture {
 		apps:   filepath.Join(home, "Applications"),
 		system: filepath.Join(home, "system"),
 		tmp:    filepath.Join(home, "tmp"),
+		env:    map[string]string{"FCM_RUNNING_OWNERS": ""},
 	}
 	for _, d := range []string{f.caches, f.apps, f.system, f.tmp} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -148,6 +152,51 @@ func (f *fixture) addFile(t *testing.T, path string, size int64) string {
 	return path
 }
 
+// addManyFiles makes a directory slow enough to walk to exercise budgets and
+// cancellation without any artificial delays in the scanner.
+func (f *fixture) addManyFiles(t *testing.T, path string, count int) string {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < count; i++ {
+		if err := os.WriteFile(filepath.Join(path, fmt.Sprintf("f%06d", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return path
+}
+
+func setModTime(t *testing.T, path string, when time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func skipFor(skips []skipDoc, path string) *skipDoc {
+	for i := range skips {
+		if skips[i].Path == path {
+			return &skips[i]
+		}
+	}
+	return nil
+}
+
+// setenv overrides one environment variable for later runs of the binary.
+func (f *fixture) setenv(key, value string) { f.env[key] = value }
+
+func (f *fixture) unsetenv(key string) { delete(f.env, key) }
+
+// agePath moves a path's modification time into the past.
+func (f *fixture) agePath(t *testing.T, path string, age time.Duration) {
+	t.Helper()
+	when := time.Now().Add(-age)
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // writeConfig writes a file under the tool's config directory.
 func (f *fixture) writeConfig(t *testing.T, rel, content string) string {
 	t.Helper()
@@ -179,16 +228,24 @@ func (f *fixture) addApp(t *testing.T, bundleID, displayName string) {
 	}
 }
 
-func (f *fixture) run(t *testing.T, args ...string) (stdout, stderr string, code int) {
-	t.Helper()
-	cmd := exec.Command(binary, args...)
-	cmd.Env = []string{
+func (f *fixture) environ() []string {
+	env := []string{
 		"HOME=" + f.home,
 		"TMPDIR=" + f.tmp + "/",
 		"FCM_APPS_DIRS=" + f.apps,
 		"FCM_SYSTEM_ROOT=" + f.system,
 		"PATH=" + os.Getenv("PATH"),
 	}
+	for key, value := range f.env {
+		env = append(env, key+"="+value)
+	}
+	return env
+}
+
+func (f *fixture) run(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	cmd := exec.Command(binary, args...)
+	cmd.Env = f.environ()
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
@@ -481,11 +538,13 @@ func TestFullRuleInventoryListsEveryPathShape(t *testing.T) {
 		f.addPath(t, "Library/Logs/DiagnosticReports", 1*1024*1024),
 		f.addPath(t, "Library/Application Support/CrashReporter", 1*1024*1024),
 		f.addSystemPath(t, "Library/Caches/system.thing", 1*1024*1024),
-		f.addTempPath(t, "foo/C/blob", 1*1024*1024),
 		f.addPath(t, ".huggingface", 1*1024*1024),
 		f.addPath(t, ".cache/huggingface", 1*1024*1024),
 		f.addPath(t, "Library/Application Support/com.missing.Leftover", 1*1024*1024),
 	}
+	tempPath := f.addTempPath(t, "foo/C/blob", 1*1024*1024)
+	f.agePath(t, tempPath, 8*24*time.Hour)
+	expected = append(expected, tempPath)
 
 	d := f.scanJSON(t)
 	if len(expected) != 31 {
@@ -675,4 +734,167 @@ func duSize(t *testing.T, path string) int64 {
 		t.Fatalf("parsing du output %q: %v", out, err)
 	}
 	return blocks * 512
+}
+
+func TestUnreadableDirectoryIsSkippedNotFatal(t *testing.T) {
+	f := newFixture(t)
+	blocked := f.addCache(t, "Blocked", 12*1024*1024)
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o755) })
+
+	d := f.scanJSON(t)
+	if itemByPath(allItems(d), blocked) != nil {
+		t.Errorf("unreadable path %q appeared as a Junk Item", blocked)
+	}
+	skip := skipFor(d.Skipped, blocked)
+	if skip == nil {
+		t.Fatalf("skipped[] has no entry for %q: %+v", blocked, d.Skipped)
+	}
+	if skip.Reason != "no-permission" {
+		t.Errorf("skip reason = %q, want no-permission", skip.Reason)
+	}
+}
+
+func TestRunningOwnerIsSkipped(t *testing.T) {
+	live := exec.Command("sleep", "30")
+	if err := live.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = live.Process.Kill()
+		_ = live.Wait()
+	})
+	time.Sleep(10 * time.Millisecond)
+
+	f := newFixture(t)
+	f.unsetenv("FCM_RUNNING_OWNERS")
+	f.writeConfig(t, "rules.d/running.yaml", `
+rules:
+  - name: running-owner
+    pattern: ${HOME}/Library/Caches/RunningOwner
+    owner: sleep
+    kind: cache
+    risk: safe
+    rebuild: low
+`)
+	running := f.addCache(t, "RunningOwner", 12*1024*1024)
+	visible := f.addCache(t, "Visible", 12*1024*1024)
+
+	d := f.scanJSON(t)
+	if itemByPath(allItems(d), running) != nil {
+		t.Errorf("running owner's path %q appeared in owners[]", running)
+	}
+	if itemByPath(allItems(d), visible) == nil {
+		t.Errorf("idle path %q is missing", visible)
+	}
+	skip := skipFor(d.Skipped, running)
+	if skip == nil {
+		t.Fatalf("skipped[] has no entry for %q: %+v", running, d.Skipped)
+	}
+	if skip.Reason != "running" {
+		t.Errorf("skip reason = %q, want running", skip.Reason)
+	}
+}
+
+func TestPathOverThePerPathBudgetIsSkipped(t *testing.T) {
+	f := newFixture(t)
+	f.setenv("FCM_PATH_TIMEOUT", "10ms")
+	big := f.addManyFiles(t, filepath.Join(f.caches, "Big"), 20000)
+	small := f.addCache(t, "Small", 12*1024*1024)
+
+	d := f.scanJSON(t)
+	if itemByPath(allItems(d), big) != nil {
+		t.Errorf("timed-out path %q appeared as a Junk Item", big)
+	}
+	if itemByPath(allItems(d), small) == nil {
+		t.Errorf("the rest of the scan did not complete: %q is missing", small)
+	}
+	skip := skipFor(d.Skipped, big)
+	if skip == nil {
+		t.Fatalf("skipped[] has no entry for %q", big)
+	}
+	if skip.Reason != "timeout" {
+		t.Errorf("skip reason = %q, want timeout", skip.Reason)
+	}
+}
+
+func TestTempScopeOnlyIncludesEntriesOlderThanSevenDays(t *testing.T) {
+	f := newFixture(t)
+	now := time.Date(2030, 1, 15, 12, 0, 0, 0, time.UTC)
+	f.setenv("FCM_NOW", now.Format(time.RFC3339))
+
+	old := f.addTempPath(t, "foo/C/old", 12*1024*1024)
+	fresh := f.addTempPath(t, "foo/C/fresh", 12*1024*1024)
+	setModTime(t, old, now.Add(-8*24*time.Hour))
+	setModTime(t, fresh, now.Add(-24*time.Hour))
+	f.addCache(t, "Arc", 12*1024*1024)
+
+	d := f.scanJSON(t)
+	items := allItems(d)
+	if itemByPath(items, old) == nil {
+		t.Errorf("8-day-old temp entry %q is missing", old)
+	}
+	if itemByPath(items, fresh) != nil {
+		t.Errorf("1-day-old temp entry %q must be excluded", fresh)
+	}
+}
+
+func TestSymlinkCycleTerminates(t *testing.T) {
+	f := newFixture(t)
+	cycle := f.addCache(t, "Cycle", 12*1024*1024)
+	if err := os.Symlink(cycle, filepath.Join(cycle, "self")); err != nil {
+		t.Fatal(err)
+	}
+
+	d := f.scanJSON(t)
+	if itemByPath(allItems(d), cycle) == nil {
+		t.Errorf("cycle directory %q is missing", cycle)
+	}
+}
+
+func TestPathRemovedBetweenListingAndSizingIsSkipped(t *testing.T) {
+	f := newFixture(t)
+	big := f.addManyFiles(t, filepath.Join(f.caches, "ABig"), 20000)
+	vanished := f.addCache(t, "ZVanish", 12*1024*1024)
+
+	cmd := exec.Command(binary, "scan", "--json", "--jobs", "1")
+	cmd.Env = f.environ()
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if err := os.RemoveAll(vanished); err != nil {
+		t.Fatal(err)
+	}
+	waitErr := cmd.Wait()
+	if exitErr, ok := waitErr.(*exec.ExitError); ok {
+		if code := exitErr.ExitCode(); code != 0 && code != 3 {
+			t.Fatalf("scan exited %d after a path vanished (stderr: %s)", code, errOut.String())
+		}
+	} else if waitErr != nil {
+		t.Fatalf("scan failed after a path vanished: %v", waitErr)
+	}
+
+	var d doc
+	if err := json.Unmarshal(out.Bytes(), &d); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out.String())
+	}
+	if itemByPath(allItems(d), big) == nil {
+		t.Errorf("the rest of the scan did not complete: %q is missing", big)
+	}
+	if itemByPath(allItems(d), vanished) != nil {
+		t.Errorf("vanished path %q appeared as a Junk Item", vanished)
+	}
+	skip := skipFor(d.Skipped, vanished)
+	if skip == nil {
+		t.Fatalf("skipped[] has no entry for %q: %+v", vanished, d.Skipped)
+	}
+	if skip.Reason != "vanished" {
+		t.Errorf("skip reason = %q, want vanished", skip.Reason)
+	}
 }
