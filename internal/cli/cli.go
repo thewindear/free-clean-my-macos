@@ -47,7 +47,6 @@ Usage:
   fcm clean --yes [--json] [--trash-dir DIR] [--only-kind cache,log] [--jobs N] [--permanent]
                            remove every Junk Item: cheap ones deleted outright,
                            the rest moved into the Trash; --permanent bypasses it
-                           the rest moved into the Trash
   fcm rules list [--rules-dir DIR]
                            print the effective Scan Rules and mark the overrides
   fcm rules reload [--rules-dir DIR]
