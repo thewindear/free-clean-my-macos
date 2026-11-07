@@ -135,9 +135,17 @@ func Parse(data []byte) ([]Rule, error) {
 	return f.Rules, nil
 }
 
-// LoadDir reads every *.yaml / *.yml file in dir in filename order. A missing
-// directory is not an error: it means the user has no overrides.
-func LoadDir(dir string) ([]Rule, error) {
+// File is one rule file's contribution to the rule set.
+type File struct {
+	Path  string
+	Rules []Rule
+}
+
+// LoadFiles reads every *.yaml / *.yml file in dir in filename order, reporting
+// each file separately so `fcm rules reload` can say what it re-read and how
+// much each file contributed. A missing directory is not an error: it means the
+// user has no overrides.
+func LoadFiles(dir string) ([]File, error) {
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -146,21 +154,22 @@ func LoadDir(dir string) ([]Rule, error) {
 		return nil, err
 	}
 
-	var files []string
+	var names []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(e.Name()))
 		if ext == ".yaml" || ext == ".yml" {
-			files = append(files, e.Name())
+			names = append(names, e.Name())
 		}
 	}
-	sort.Strings(files)
+	sort.Strings(names)
 
-	var out []Rule
-	for _, name := range files {
-		data, err := os.ReadFile(filepath.Join(dir, name))
+	out := make([]File, 0, len(names))
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, err
 		}
@@ -168,27 +177,73 @@ func LoadDir(dir string) ([]Rule, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
-		out = append(out, rs...)
+		out = append(out, File{Path: path, Rules: rs})
 	}
 	return out, nil
 }
 
-// Merge layers overrides on top of base. A rule whose Name already exists
-// replaces it in place; a new Name is appended. That is the same-name override
-// policy for ~/.config/free-clean-my-macos/rules.d.
-func Merge(base, overrides []Rule) []Rule {
-	out := cloneRules(base)
-	index := make(map[string]int, len(out))
-	for i, r := range out {
-		index[r.Name] = i
+// LoadDir reads every rule file in dir and flattens them into one slice.
+func LoadDir(dir string) ([]Rule, error) {
+	files, err := LoadFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []Rule
+	for _, f := range files {
+		out = append(out, f.Rules...)
+	}
+	return out, nil
+}
+
+// Source says where a rule in the effective set came from.
+type Source string
+
+const (
+	SourceEmbedded Source = "embedded"
+	SourceUser     Source = "user"
+	SourceOverride Source = "override"
+)
+
+// Effective is one Scan Rule in the merged set, with where it came from.
+type Effective struct {
+	Rule   Rule
+	Source Source
+	// Superseded is the embedded Rule this one replaced. Set only for
+	// SourceOverride, so a reader can be told what changed.
+	Superseded *Rule
+}
+
+// EffectiveRules layers overrides on top of base and records the provenance of
+// every rule. A rule whose Name already exists replaces it in place and is
+// marked SourceOverride; a new Name is appended as SourceUser. That is the
+// same-name override policy for ~/.config/free-clean-my-macos/rules.d, and it is
+// what `fcm rules list` marks.
+func EffectiveRules(base, overrides []Rule) []Effective {
+	out := make([]Effective, 0, len(base)+len(overrides))
+	index := make(map[string]int, len(base))
+	for _, r := range base {
+		index[r.Name] = len(out)
+		out = append(out, Effective{Rule: cloneRule(r), Source: SourceEmbedded})
 	}
 	for _, r := range overrides {
 		if i, ok := index[r.Name]; ok {
-			out[i] = r
+			replaced := out[i].Rule
+			out[i] = Effective{Rule: cloneRule(r), Source: SourceOverride, Superseded: &replaced}
 			continue
 		}
 		index[r.Name] = len(out)
-		out = append(out, r)
+		out = append(out, Effective{Rule: cloneRule(r), Source: SourceUser})
+	}
+	return out
+}
+
+// Merge layers overrides on top of base. It is EffectiveRules without the
+// provenance, which is all the engine needs to scan.
+func Merge(base, overrides []Rule) []Rule {
+	effective := EffectiveRules(base, overrides)
+	out := make([]Rule, len(effective))
+	for i, e := range effective {
+		out[i] = e.Rule
 	}
 	return out
 }
@@ -438,13 +493,17 @@ func validatePathPattern(p string) error {
 	return nil
 }
 
+func cloneRule(r Rule) Rule {
+	if r.Patterns != nil {
+		r.Patterns = append([]string(nil), r.Patterns...)
+	}
+	return r
+}
+
 func cloneRules(rs []Rule) []Rule {
 	out := make([]Rule, len(rs))
 	for i, r := range rs {
-		if r.Patterns != nil {
-			r.Patterns = append([]string(nil), r.Patterns...)
-		}
-		out[i] = r
+		out[i] = cloneRule(r)
 	}
 	return out
 }
