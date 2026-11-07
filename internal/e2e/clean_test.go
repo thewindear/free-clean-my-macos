@@ -32,17 +32,19 @@ type failureDoc struct {
 }
 
 type cleanSummaryDoc struct {
-	FreedBytes int64        `json:"freed_bytes"`
-	MovedBytes int64        `json:"moved_bytes"`
-	Items      int          `json:"items"`
-	Failed     []failureDoc `json:"failed"`
-	LogPath    string       `json:"log_path"`
+	FreedBytes   int64        `json:"freed_bytes"`
+	MovedBytes   int64        `json:"moved_bytes"`
+	Items        int          `json:"items"`
+	NotAttempted int          `json:"not_attempted"`
+	Failed       []failureDoc `json:"failed"`
+	LogPath      string       `json:"log_path"`
 }
 
 type cleanDoc struct {
 	Schema    int             `json:"schema"`
 	CleanedAt string          `json:"cleaned_at"`
 	DryRun    bool            `json:"dry_run"`
+	Cancelled bool            `json:"cancelled"`
 	Items     []cleanItemDoc  `json:"items"`
 	Summary   cleanSummaryDoc `json:"summary"`
 }
@@ -404,6 +406,7 @@ func TestCleanUsageErrorsExitTwo(t *testing.T) {
 		{"clean", "--yes", "--only-kind", "junk"}, // unknown Kind
 		{"clean", "--yes", "--nonsense"},          // unknown flag
 		{"clean", "--yes", "extra"},               // stray argument
+		{"clean", "--permanent"},                  // irreversible mode needs --yes
 	} {
 		_, stderr, code := f.run(t, args...)
 		if code != 2 {
@@ -428,6 +431,47 @@ func TestCleanTextSummarySeparatesSpaceFreedFromSpaceMoved(t *testing.T) {
 	for _, want := range []string{"Space Freed", "Space Moved", "Cleanup Log", "empty the Trash"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("Summary is missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestCleanPermanentDeletesCautionAndHighRebuildItemsOutright(t *testing.T) {
+	f := newFixture(t)
+	f.addApp(t, "com.example.Slack", "Slack")
+	cheap := f.addCache(t, "com.example.Slack", 12*1024*1024)
+	caution := f.addOrphan(t, "com.example.Gone", 3*1024*1024)
+	high := f.addCache(t, "JetBrains", 5*1024*1024)
+
+	d, code := f.cleanJSON(t, "--yes", "--permanent", "--json", "--trash-dir", f.trashDir())
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (summary: %+v)", code, d.Summary)
+	}
+	for _, path := range []string{cheap, caution, high} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("permanent item %q is still on disk: %v", path, err)
+		}
+		it := cleanItemFor(t, d, path)
+		if it.Mode != "permanent" {
+			t.Errorf("%q mode = %q, want permanent", path, it.Mode)
+		}
+		if it.Outcome != "deleted" {
+			t.Errorf("%q outcome = %q, want deleted", path, it.Outcome)
+		}
+	}
+	wantFreed := cleanItemFor(t, d, cheap).Size + cleanItemFor(t, d, caution).Size + cleanItemFor(t, d, high).Size
+	if d.Summary.FreedBytes != wantFreed {
+		t.Errorf("freed_bytes = %d, want all %d bytes", d.Summary.FreedBytes, wantFreed)
+	}
+	if d.Summary.MovedBytes != 0 {
+		t.Errorf("moved_bytes = %d, want 0 under Permanent Delete", d.Summary.MovedBytes)
+	}
+	if _, err := os.Stat(f.trashDir()); err == nil {
+		t.Error("Permanent Delete created the Trash directory")
+	}
+
+	for _, rec := range readLog(t, d.Summary.LogPath) {
+		if rec.Mode != "permanent" || rec.Outcome != "deleted" {
+			t.Errorf("log record = %+v, want permanent/deleted", rec)
 		}
 	}
 }

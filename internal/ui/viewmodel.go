@@ -35,6 +35,9 @@ const (
 	ActionNone Action = iota
 	ActionQuit
 	ActionCancelScan
+	// ActionCancelClean asks the shell to stop the running Cleanup after the
+	// item in flight; the model already knows the Summary is what happens next.
+	ActionCancelClean
 	// ActionClean asks the shell to run the Cleanup the model has prepared and
 	// can hand back through CleanPaths.
 	ActionClean
@@ -125,10 +128,11 @@ type Stats struct {
 type ItemState string
 
 const (
-	StatePending    ItemState = "pending"
-	StateInProgress ItemState = "in-progress"
-	StateDone       ItemState = "done"
-	StateFailed     ItemState = "failed"
+	StatePending      ItemState = "pending"
+	StateInProgress   ItemState = "in-progress"
+	StateDone         ItemState = "done"
+	StateFailed       ItemState = "failed"
+	StateNotAttempted ItemState = "not-attempted"
 )
 
 // overlay is which modal panel is up, if any.
@@ -178,14 +182,17 @@ type Model struct {
 	scroll  int
 
 	// The Cleanup: what the gate is asking about, what the shell is running,
-	// and what happened to each Junk Item.
-	confirmation Confirmation
-	pending      []clean.Candidate
-	cleaning     bool
-	states       map[string]ItemState
-	failures     map[string]string
-	cleanup      CleanupProgress
-	result       *clean.Result
+	// what happened to each Junk Item, and whether the last run left work
+	// unfinished.
+	confirmation      Confirmation
+	pending           []clean.Candidate
+	cleaning          bool
+	permanent         bool
+	cleanupIncomplete bool
+	states            map[string]ItemState
+	failures          map[string]string
+	cleanup           CleanupProgress
+	result            *clean.Result
 }
 
 // CleanupProgress is the live "how far has the Cleanup got" counter.
@@ -285,6 +292,22 @@ func (m *Model) Cursor() int { return m.cursor }
 // HandleKey applies one key press and reports what the shell should do about
 // it.
 func (m *Model) HandleKey(k Key) Action {
+	if m.cleaning {
+		switch k {
+		case KeyEsc:
+			m.notice = "stopping after the item in flight…"
+			return ActionCancelClean
+		case KeyQuit:
+			// A Cleanup is a sequence of destructive steps. Quitting outright
+			// would kill the process mid-item, so q only points at the safe
+			// stop.
+			m.notice = "cleanup running — esc stops after the current item"
+			return ActionNone
+		default:
+			return ActionNone
+		}
+	}
+
 	if k == KeyQuit && !m.editing {
 		return ActionQuit
 	}
@@ -430,9 +453,7 @@ func (m *Model) startClean() Action {
 		return ActionNone
 	}
 
-	// The TUI has no Permanent Delete mode of its own yet; when it grows one,
-	// this is the flag that gates it.
-	if confirmation := Confirm(selected, false); confirmation.Required {
+	if confirmation := Confirm(selected, m.permanent); confirmation.Required {
 		m.confirmation = confirmation
 		m.overlay = overlayConfirm
 		return ActionNone
@@ -446,6 +467,7 @@ func (m *Model) startClean() Action {
 // order the shell should work through.
 func (m *Model) beginClean(selected []clean.Candidate) {
 	m.cleaning = true
+	m.cleanupIncomplete = false
 	m.notice = ""
 	m.pending = append([]clean.Candidate(nil), selected...)
 	m.cleanup = CleanupProgress{Count: len(selected)}
@@ -472,6 +494,17 @@ func (m *Model) selectedCandidates() []clean.Candidate {
 
 // Cleaning reports whether a Cleanup is running.
 func (m *Model) Cleaning() bool { return m.cleaning }
+
+// SetPermanent enables Permanent Delete for the next Cleanup. The gate still
+// asks, whatever the selection looks like.
+func (m *Model) SetPermanent(permanent bool) { m.permanent = permanent }
+
+// Permanent reports whether Permanent Delete is active.
+func (m *Model) Permanent() bool { return m.permanent }
+
+// CleanupIncomplete reports whether the last Cleanup left selected Junk Items
+// unattempted, which is what makes the shell exit 1.
+func (m *Model) CleanupIncomplete() bool { return m.cleanupIncomplete }
 
 // PendingCandidates is the ordered selection the shell should hand to the
 // Cleanup: the exact Junk Items the user confirmed, with the sizes they saw.
@@ -524,10 +557,13 @@ func (m *Model) ApplyCleanEvent(ev clean.Event) {
 	case clean.EventItemStarted:
 		m.states[ev.Item.Path] = StateInProgress
 	case clean.EventItemFinished:
-		if ev.Item.Outcome == clean.OutcomeFailed {
+		switch ev.Item.Outcome {
+		case clean.OutcomeFailed:
 			m.states[ev.Item.Path] = StateFailed
 			m.failures[ev.Item.Path] = ev.Item.Error
-		} else {
+		case clean.OutcomeNotAttempted:
+			m.states[ev.Item.Path] = StateNotAttempted
+		default:
 			m.states[ev.Item.Path] = StateDone
 		}
 		m.cleanup.Items = ev.Summary.Items + len(ev.Summary.Failed)
@@ -541,8 +577,9 @@ func (m *Model) ApplyCleanEvent(ev clean.Event) {
 func (m *Model) FinishClean(result clean.Result, err error) {
 	m.cleaning = false
 	if err != nil {
-		// The run never started, so the rows go back to how they were and the
-		// selection stays put for another attempt.
+		// The run never started or had to stop, so the rows go back to how
+		// they were and the selection stays put for another attempt.
+		m.cleanupIncomplete = len(m.pending) > 0
 		for _, c := range m.pending {
 			delete(m.states, c.Path)
 		}
@@ -552,25 +589,40 @@ func (m *Model) FinishClean(result clean.Result, err error) {
 		return
 	}
 
+	notAttempted := 0
 	for _, it := range result.Items {
-		if it.Outcome == clean.OutcomeFailed {
+		switch it.Outcome {
+		case clean.OutcomeFailed:
 			m.states[it.Path] = StateFailed
 			m.failures[it.Path] = it.Error
-			continue
+		case clean.OutcomeNotAttempted:
+			m.states[it.Path] = StateNotAttempted
+			notAttempted++
+		default:
+			m.states[it.Path] = StateDone
+			delete(m.selected, it.Path)
 		}
-		m.states[it.Path] = StateDone
-		delete(m.selected, it.Path)
+	}
+	if notAttempted < result.Summary.NotAttempted {
+		notAttempted = result.Summary.NotAttempted
+	}
+	if result.Summary.NotAttempted < notAttempted {
+		result.Summary.NotAttempted = notAttempted
 	}
 	m.pending = nil
 	m.cleanup = CleanupProgress{
-		Items:      len(result.Items),
+		Items:      result.Summary.Items + len(result.Summary.Failed),
 		Count:      len(result.Items),
 		Bytes:      result.Summary.FreedBytes + result.Summary.MovedBytes,
 		TotalBytes: result.Summary.FreedBytes + result.Summary.MovedBytes,
 	}
-	if len(result.Summary.Failed) > 0 {
+	m.cleanupIncomplete = notAttempted > 0
+	switch {
+	case notAttempted > 0:
+		m.notice = format.Count(notAttempted, "item") + " not attempted — press c to retry"
+	case len(result.Summary.Failed) > 0:
 		m.notice = format.Count(len(result.Summary.Failed), "failure") + " — press c to retry"
-	} else {
+	default:
 		m.notice = "cleanup complete"
 	}
 	m.result = &result

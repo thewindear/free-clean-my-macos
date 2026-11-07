@@ -80,6 +80,12 @@ func (m *Model) summaryPanel() panel {
 		Field{Label: "Space Moved", Value: format.Bytes(s.MovedBytes)},
 		Field{Label: "Items cleaned", Value: format.Count(s.Items, "item")},
 	)
+	if s.NotAttempted > 0 {
+		p.Fields = append(p.Fields, Field{
+			Label: "Not attempted",
+			Value: format.Count(s.NotAttempted, "item") + " left in the list — press c to retry",
+		})
+	}
 	if len(s.Failed) > 0 {
 		p.Fields = append(p.Fields, Field{
 			Label: "Failed",

@@ -116,6 +116,8 @@ func stateMark(state ItemState) string {
 		return "[✓]"
 	case StateFailed:
 		return "[!]"
+	case StateNotAttempted:
+		return "[-]"
 	default:
 		return "[·]"
 	}
@@ -176,7 +178,7 @@ func (m *Model) hintLine() string {
 	case m.editing:
 		return "enter apply · esc clear"
 	case m.cleaning:
-		return "cleaning… q quits, the Cleanup Log keeps what happened"
+		return "cleaning… esc stops after the current item"
 	case m.phase == PhaseScanning:
 		return "esc cancel scan · q quit"
 	default:

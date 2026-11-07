@@ -203,3 +203,98 @@ func TestScreenDeclineLeavesTheDiskAlone(t *testing.T) {
 		t.Errorf("declining must leave the item on disk: %v", err)
 	}
 }
+
+func TestScreenPermanentModeGatesAndBypassesTheTrash(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "Cache", "com.example.Caution")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "blob.bin"), make([]byte, 2048), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report := engine.Report{Owners: []engine.Owner{{
+		ID: "com.example.Caution", Name: "Caution", Total: 2048, Items: []engine.Item{{
+			Path: target, Size: 2048, Kind: rules.KindCache, Risk: rules.RiskSafe,
+			Rebuild: rules.RebuildLow, Recommended: true, Rule: "caches-generic",
+		}},
+	}}, Summary: engine.Summary{Items: 1, TotalBytes: 2048}}
+
+	screen := newScreen(engine.Options{Home: dir}, clean.Options{
+		TrashDir:  filepath.Join(dir, "trash"),
+		StateDir:  filepath.Join(dir, "state"),
+		Permanent: true,
+	})
+	screen.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	screen.model.FinishScan(report, nil)
+
+	// A cheap safe selection would normally clean immediately, but Permanent
+	// Delete always stops for confirmation.
+	screen.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if _, ok := screen.model.PendingConfirmation(); !ok {
+		t.Fatal("--permanent did not open the confirmation gate")
+	}
+	if screen.model.Cleaning() {
+		t.Fatal("nothing may run before the user confirms")
+	}
+
+	screen.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	pumpUntilDone(t, screen)
+	summary, _ := screen.model.CleanSummary()
+	if len(summary.Items) != 1 || summary.Items[0].Mode != clean.ModePermanent {
+		t.Fatalf("cleanup items = %+v, want one permanent delete", summary.Items)
+	}
+	if summary.Summary.FreedBytes != 2048 {
+		t.Errorf("Space Freed = %d, want 2048", summary.Summary.FreedBytes)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "trash")); err == nil {
+		t.Error("Permanent Delete created the Trash directory")
+	}
+}
+
+func TestScreenEscCancelsTheCleanupAndShowsThePartialSummary(t *testing.T) {
+	dir := t.TempDir()
+	var targets []string
+	for _, name := range []string{"com.example.One", "com.example.Two"} {
+		target := filepath.Join(dir, "Cache", name)
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(target, "blob.bin"), make([]byte, 2048), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		targets = append(targets, target)
+	}
+	var items []engine.Item
+	for _, target := range targets {
+		items = append(items, engine.Item{
+			Path: target, Size: 2048, Kind: rules.KindCache, Risk: rules.RiskSafe,
+			Rebuild: rules.RebuildLow, Recommended: true, Rule: "caches-generic",
+		})
+	}
+	report := engine.Report{Owners: []engine.Owner{{
+		ID: "com.example.App", Name: "App", Total: 4096, Items: items,
+	}}, Summary: engine.Summary{Items: 2, TotalBytes: 4096}}
+
+	screen := newScreen(engine.Options{Home: dir}, clean.Options{
+		TrashDir: filepath.Join(dir, "trash"),
+		StateDir: filepath.Join(dir, "state"),
+	})
+	screen.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	screen.model.FinishScan(report, nil)
+	screen.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	screen.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	pumpUntilDone(t, screen)
+	summary, ok := screen.model.CleanSummary()
+	if !ok {
+		t.Fatal("the partial Summary did not open after esc")
+	}
+	if summary.Summary.NotAttempted == 0 {
+		t.Fatalf("Summary = %+v, want at least one not-attempted item", summary.Summary)
+	}
+	if !screen.model.CleanupIncomplete() {
+		t.Error("the screen should report an incomplete Cleanup for the exit code")
+	}
+}
