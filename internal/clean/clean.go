@@ -51,14 +51,38 @@ const (
 var errVanished = errors.New("path vanished before it could be removed")
 
 // Options carries every edge of a Cleanup: where the Trash is, where the
-// Cleanup Log lives, whether this is a dry run, which Kinds are selected, and
-// the clock.
+// Cleanup Log lives, whether this is a dry run, where the progress events go,
+// and the clock.
 type Options struct {
-	TrashDir  string
-	StateDir  string
-	DryRun    bool
-	OnlyKinds []rules.Kind
-	Now       func() time.Time
+	TrashDir string
+	StateDir string
+	DryRun   bool
+	Now      func() time.Time
+
+	// Emit receives one started and one finished event per Junk Item, from the
+	// goroutine that runs the Cleanup.
+	Emit func(Event)
+}
+
+// EventKind is what one Cleanup event reports.
+type EventKind string
+
+const (
+	// EventItemStarted means the item is about to be removed: the row can show
+	// it as in progress.
+	EventItemStarted EventKind = "item-started"
+	// EventItemFinished means it is done or failed, and Summary says how much
+	// has been accounted for so far.
+	EventItemFinished EventKind = "item-finished"
+)
+
+// Event is one step of a Cleanup, streamed as it happens so a list screen can
+// move each Junk Item through pending -> in-progress -> done or failed. The
+// Summary is cumulative and never shrinks.
+type Event struct {
+	Kind    EventKind
+	Item    Item
+	Summary Summary
 }
 
 // Candidate is one selected Junk Item, flattened out of the scan Report with
@@ -156,11 +180,12 @@ func Select(report engine.Report, kinds []rules.Kind) []Candidate {
 	return out
 }
 
-// Run executes the Cleanup of every selected Junk Item. A dry run builds the
-// plan and touches nothing, not even the Cleanup Log. A returned error means
-// the run could not start or had to stop; per-item failures are reported in the
-// Summary instead.
-func Run(ctx context.Context, report engine.Report, opts Options) (Result, error) {
+// Run executes the Cleanup of exactly the given Junk Items, in the given order
+// (largest first is what Select returns, and what a progress list reads best).
+// A dry run builds the plan and touches nothing, not even the Cleanup Log. A
+// returned error means the run could not start or had to stop; per-item
+// failures are reported in the Summary instead.
+func Run(ctx context.Context, selected []Candidate, opts Options) (Result, error) {
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -175,7 +200,6 @@ func Run(ctx context.Context, report engine.Report, opts Options) (Result, error
 		Summary:   Summary{Failed: []Failure{}},
 	}
 
-	selected := Select(report, opts.OnlyKinds)
 	if len(selected) == 0 {
 		return result, nil
 	}
@@ -210,6 +234,7 @@ func Run(ctx context.Context, report engine.Report, opts Options) (Result, error
 			Mode:      ModeFor(c.Risk, c.Rebuild),
 			Timestamp: now().Format(time.RFC3339),
 		}
+		emit(opts, Event{Kind: EventItemStarted, Item: item, Summary: snapshot(result.Summary)})
 
 		if opts.DryRun {
 			item.Outcome = OutcomePlanned
@@ -220,6 +245,7 @@ func Run(ctx context.Context, report engine.Report, opts Options) (Result, error
 				result.Summary.MovedBytes += item.Size
 			}
 			result.Items = append(result.Items, item)
+			emit(opts, Event{Kind: EventItemFinished, Item: item, Summary: snapshot(result.Summary)})
 			continue
 		}
 
@@ -246,9 +272,24 @@ func Run(ctx context.Context, report engine.Report, opts Options) (Result, error
 			return result, fmt.Errorf("clean: writing the Cleanup Log: %w", err)
 		}
 		result.Items = append(result.Items, item)
+		emit(opts, Event{Kind: EventItemFinished, Item: item, Summary: snapshot(result.Summary)})
 	}
 
 	return result, nil
+}
+
+// emit hands one event to the consumer when there is one.
+func emit(opts Options, ev Event) {
+	if opts.Emit != nil {
+		opts.Emit(ev)
+	}
+}
+
+// snapshot copies a Summary for an event, so a later failure cannot change an
+// event the consumer already holds.
+func snapshot(s Summary) Summary {
+	s.Failed = append([]Failure(nil), s.Failed...)
+	return s
 }
 
 // needsTrash reports whether any selected item has to be moved into the Trash.

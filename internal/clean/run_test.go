@@ -11,25 +11,19 @@ import (
 	"github.com/thewindear/free-clean-my-macos/internal/rules"
 )
 
-// reportFor builds the scan Report a Cleanup consumes, so a test can name a
-// path that no longer exists on disk.
-func reportFor(items ...engine.Item) engine.Report {
-	return engine.Report{Owners: []engine.Owner{{ID: "com.example.App", Items: items}}}
-}
-
 // TestVanishedItemIsAFailureNotFreeSpace pins the honesty rule: bytes the tool
 // did not touch are never counted, even when the path is simply gone.
 func TestVanishedItemIsAFailureNotFreeSpace(t *testing.T) {
 	dir := t.TempDir()
 	gone := filepath.Join(dir, "Caches", "com.example.App")
 
-	result, err := clean.Run(context.Background(), reportFor(engine.Item{
+	result, err := clean.Run(context.Background(), []clean.Candidate{{
 		Path:    gone,
 		Size:    64 * 1024 * 1024,
-		Kind:    rules.KindCache,
+		Owner:   "com.example.App",
 		Risk:    rules.RiskSafe,
 		Rebuild: rules.RebuildLow,
-	}), clean.Options{
+	}}, clean.Options{
 		TrashDir: filepath.Join(dir, "trash"),
 		StateDir: filepath.Join(dir, "state"),
 	})
@@ -70,12 +64,12 @@ func TestTwoItemsWithTheSameNameBothSurvive(t *testing.T) {
 		}
 	}
 	// Both are caution items, so both are moved rather than deleted.
-	caution := engine.Item{Kind: rules.KindCache, Risk: rules.RiskCaution, Rebuild: rules.RebuildNone}
+	caution := clean.Candidate{Owner: "com.example.App", Risk: rules.RiskCaution, Rebuild: rules.RebuildNone}
 	one, two := caution, caution
 	one.Path, two.Path = first, second
 	one.Size, two.Size = 10, 20
 
-	if _, err := clean.Run(context.Background(), reportFor(one, two), clean.Options{
+	if _, err := clean.Run(context.Background(), []clean.Candidate{one, two}, clean.Options{
 		TrashDir: trash,
 		StateDir: filepath.Join(dir, "state"),
 	}); err != nil {

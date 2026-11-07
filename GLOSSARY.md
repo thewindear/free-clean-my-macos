@@ -77,6 +77,14 @@ _Avoid_: 已释放（用于这部分数据）
 An explicitly requested mode that bypasses the Trash and removes items irrecoverably; needs a second confirmation.
 _Avoid_: 彻底删除, 强删
 
+**Confirmation Gate**（确认关卡）:
+The stop before a Cleanup worth pausing for: any single Junk Item ≥ 5 GB, any `caution` item, or Permanent Delete. It names the specific Junk Items and their total, and it is never default-yes — nothing has run while it is up, so declining costs nothing.
+_Avoid_: 二次确认弹窗
+
+**Retry**（重试）:
+Cleaning the items a failed Cleanup left behind. They stay selected and stay in the list, so a retry is the same `c` again once the cause is gone.
+_Avoid_: 重新开始
+
 **Cleanup Log**（清理日志）:
 The append-only `jsonl` record of every Cleanup: path, size, Owner, Risk Level, outcome, timestamp.
 _Avoid_: 操作记录
@@ -108,7 +116,7 @@ The panel one Junk Item or Owner opens into: the Scan Rule that matched, what it
 _Avoid_: 属性页
 
 **Cleanup Progress**（清理进度）:
-Per-Junk-Item outcome (pending / done / failed) plus an overall byte counter. Since Trash moves are near-instant, this is a checklist rather than a slow bar.
+Per-Junk-Item state (pending / in-progress / done / failed) plus an overall byte counter. Since Trash moves are near-instant, this is a checklist rather than a slow bar.
 _Avoid_: 进度条
 
 **Summary**（清理结果摘要）:

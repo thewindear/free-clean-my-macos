@@ -1,7 +1,6 @@
-// This file is the one white-box test in the package, and it exists for one
-// reason: the key translation table is where a typo silently breaks the whole
-// screen, and it cannot be observed through the pure model. No terminal, no
-// goroutine, no rendering is involved.
+// This file is white-box on purpose: the key translation table is where a typo
+// silently breaks the whole screen, and it cannot be observed through the pure
+// model. No terminal and no rendering are involved.
 package ui
 
 import (
@@ -9,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/thewindear/free-clean-my-macos/internal/clean"
 	"github.com/thewindear/free-clean-my-macos/internal/engine"
 	"github.com/thewindear/free-clean-my-macos/internal/rules"
 )
@@ -46,7 +46,7 @@ func TestKeyOfMapsTerminalKeysOntoTheModelVocabulary(t *testing.T) {
 }
 
 func TestScreenDrivesTheModelFromKeys(t *testing.T) {
-	s := newScreen(engine.Options{Home: "/home"})
+	s := newScreen(engine.Options{Home: "/home"}, clean.Options{})
 	s.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	s.model.FinishScan(engine.Report{Owners: []engine.Owner{{
 		ID: "com.example.App", Name: "App", Total: 20 * 1024 * 1024,
