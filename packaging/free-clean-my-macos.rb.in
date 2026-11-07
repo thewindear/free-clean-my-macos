@@ -7,17 +7,17 @@
 class FreeCleanMyMacos < Formula
   desc "Whitelist-based macOS junk scanner and cleaner"
   homepage "https://github.com/thewindear/free-clean-my-macos"
+  url "https://github.com/thewindear/free-clean-my-macos/releases/download/v@VERSION@/fcm_@VERSION@_darwin_arm64.tar.gz"
   version "@VERSION@"
+  license "MIT"
   depends_on :macos
 
   on_macos do
     on_arm do
-      url "https://github.com/thewindear/free-clean-my-macos/releases/download/v@VERSION@/fcm_@VERSION@_darwin_arm64.tar.gz"
       sha256 "@SHA_ARM64@"
     end
 
     on_intel do
-      url "https://github.com/thewindear/free-clean-my-macos/releases/download/v@VERSION@/fcm_@VERSION@_darwin_amd64.tar.gz"
       sha256 "@SHA_AMD64@"
     end
   end

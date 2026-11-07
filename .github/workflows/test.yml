@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt reports nothing when the tree is clean; nonzero output fails the job.
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "these files are not gofmt'd:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # -count=1: the process-boundary tests exec a freshly built binary, and Go's
+      # test cache cannot see it, so a cached pass would be a false green.
+      - name: test
+        run: go test -count=1 ./...

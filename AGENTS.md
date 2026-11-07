@@ -16,13 +16,13 @@ Default five-role vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `
 
 Single-context: `GLOSSARY.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.
 
-## Coding standards
+## Before committing
 
-- **Language**: Go 1.24, standard library first; no cgo. See `docs/adr/0002-*`.
-- **Vocabulary**: use the terms defined in `GLOSSARY.md` verbatim — `Junk Item`, `Owner`, `Scan Rule`, `Risk Level`, `Rebuild Cost`, `Recommended`, `Rule Precedence`, `Space Freed`, `Space Moved`. Do not invent synonyms for them in identifiers, UI strings or tests.
-- **Safety rules** (from `docs/adr/0001-*` and `0003-*`): never request Full Disk Access, never call sudo, never follow symlinks while sizing, and never let a test write inside the real `~/Library` or the real Trash.
-- **Tests live at two seams**: the process boundary (build `fcm`, run it with `HOME` / `FCM_APPS_DIRS` pointed at a fixture) and pure functions (rule precedence, recommendation policy). No tests against internals.
-- **Before committing**: `gofmt -l .` (must be empty), `go vet ./...`, `go test -count=1 ./...`. The `-count=1` matters: the process-boundary tests exec a freshly built binary, which Go's test cache cannot see.
+`gofmt -l .` (must be empty), `go vet ./...`, `go test -count=1 ./...`. CI repeats all three on every push; the `-count=1` matters because the process-boundary tests exec a freshly built binary that Go's test cache cannot see.
+
+## Reviewing a change
+
+Read [`CODING_STANDARDS.md`](./CODING_STANDARDS.md) when you review. It carries the rule about a deferred review finding becoming an issue before the ticket closes.
 
 ## Landing a ticket
 
@@ -33,3 +33,5 @@ Tickets are worked on branches in separate `git worktree`s; `main` must be green
 ```
 
 The script merges with `--no-ff`, runs `go test -count=1 ./...`, pushes, and closes the issue. It **stops** on a conflict (aborting the merge) and **rolls `main` back** if the tests are red, so `main` is never left broken. Conflicts and red tests are judgement calls; the script refuses to guess.
+
+Conflicts cluster in two places: the dispatch table in `internal/cli/cli.go` and the `Scan` loop in `internal/engine/engine.go`. Two lanes both touching one of them will conflict, so a ticket that rewrites either should say so in its body.
