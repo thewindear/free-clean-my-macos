@@ -438,3 +438,94 @@ func TestCleanWithNothingSelectedSaysSo(t *testing.T) {
 		t.Errorf("notice = %q, want it to say nothing is selected", got.Notice)
 	}
 }
+
+func TestPermanentModeGatesEvenACheapSafeSelection(t *testing.T) {
+	m := cleanReady(t)
+	m.SetPermanent(true)
+	if !m.Permanent() {
+		t.Fatal("Permanent Delete was not enabled")
+	}
+
+	if got := m.HandleKey(ui.KeyClean); got != ui.ActionNone {
+		t.Fatalf("c with Permanent Delete = %v, want the gate first", got)
+	}
+	confirmation, ok := m.PendingConfirmation()
+	if !ok {
+		t.Fatal("Permanent Delete must open the confirmation gate")
+	}
+	if !strings.Contains(strings.ToLower(strings.Join(confirmation.Reasons, " ")), "permanent") {
+		t.Errorf("confirmation reasons = %+v, want Permanent Delete named", confirmation.Reasons)
+	}
+	if m.Cleaning() {
+		t.Error("nothing may be cleaned before the user confirms")
+	}
+	if got := m.HandleKey(ui.KeyConfirm); got != ui.ActionClean {
+		t.Fatalf("confirming Permanent Delete = %v, want clean", got)
+	}
+	if !m.Cleaning() {
+		t.Error("confirming should start the Cleanup")
+	}
+}
+
+func TestEscStopsACleanupAfterTheItemInFlight(t *testing.T) {
+	m := cleanReady(t)
+	m.HandleKey(ui.KeyClean)
+
+	if got := m.HandleKey(ui.KeyEsc); got != ui.ActionCancelClean {
+		t.Fatalf("esc while cleaning = %v, want cancel-clean", got)
+	}
+	if !m.Cleaning() {
+		t.Error("esc must let the item in flight finish, not stop instantly")
+	}
+	if got := m.HandleKey(ui.KeyQuit); got != ui.ActionNone {
+		t.Errorf("q while cleaning = %v, want no action so the process is not killed mid-item", got)
+	}
+	if got := m.Stats(); !strings.Contains(got.Notice, "esc") {
+		t.Errorf("notice = %q, want it to point at esc", got.Notice)
+	}
+}
+
+func TestCancelledCleanupShowsThePartialSummaryAndKeepsUnfinishedItems(t *testing.T) {
+	m := cleanReady(t)
+	m.HandleKey(ui.KeyToggleAll) // select everything
+	m.HandleKey(ui.KeyClean)     // the gate
+	m.HandleKey(ui.KeyConfirm)   // start
+	slack := "/home/Library/Caches/com.example.Slack"
+	gone := "/home/Library/Caches/com.example.Gone"
+	big := "/home/Library/Caches/com.example.Big"
+
+	m.FinishClean(clean.Result{
+		Cancelled: true,
+		Items: []clean.Item{
+			{Candidate: candidate(slack, 12*mb, rules.RiskSafe, rules.RebuildLow), Mode: clean.ModeDelete, Outcome: clean.OutcomeDeleted},
+			{Candidate: candidate(gone, 3*mb, rules.RiskCaution, rules.RebuildNone), Mode: clean.ModeTrash, Outcome: clean.OutcomeNotAttempted},
+			{Candidate: candidate(big, 6*gb, rules.RiskSafe, rules.RebuildLow), Mode: clean.ModeDelete, Outcome: clean.OutcomeNotAttempted},
+		},
+		Summary: clean.Summary{Items: 1, FreedBytes: 12 * mb, NotAttempted: 2},
+	}, nil)
+
+	summary, ok := m.CleanSummary()
+	if !ok {
+		t.Fatal("the partial Summary did not open")
+	}
+	if !summary.Cancelled || summary.Summary.Items != 1 || summary.Summary.NotAttempted != 2 {
+		t.Fatalf("Summary = %+v, want the one completed item and two not attempted", summary.Summary)
+	}
+	if !m.CleanupIncomplete() {
+		t.Error("a cancelled Cleanup with unfinished items must report itself incomplete")
+	}
+	for _, path := range []string{gone, big} {
+		if state, ok := m.CleanState(path); !ok || state != ui.StateNotAttempted {
+			t.Errorf("state for %q = %v (%v), want not-attempted", path, state, ok)
+		}
+	}
+	if items, _ := m.Selection(); items != 2 {
+		t.Errorf("selection = %d items, want the two not-attempted items left for a retry", items)
+	}
+	if got := m.Stats(); !strings.Contains(got.Notice, "not attempted") {
+		t.Errorf("notice = %q, want it to mention the not-attempted items", got.Notice)
+	}
+	if view := m.View(); !strings.Contains(view, "Not attempted") {
+		t.Errorf("the Summary does not show the not-attempted count:\n%s", view)
+	}
+}

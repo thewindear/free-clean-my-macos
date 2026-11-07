@@ -34,16 +34,20 @@ const (
 	// ModeTrash is a move into the Trash: recoverable, and frees nothing until
 	// the Trash is emptied in Finder.
 	ModeTrash Mode = "trash"
+	// ModePermanent is an explicitly requested Permanent Delete: the Trash is
+	// bypassed even for caution or high-rebuild items.
+	ModePermanent Mode = "permanent"
 )
 
 // Outcome is what actually happened to one Junk Item.
 type Outcome string
 
 const (
-	OutcomePlanned Outcome = "planned"
-	OutcomeDeleted Outcome = "deleted"
-	OutcomeTrashed Outcome = "trashed"
-	OutcomeFailed  Outcome = "failed"
+	OutcomePlanned      Outcome = "planned"
+	OutcomeDeleted      Outcome = "deleted"
+	OutcomeTrashed      Outcome = "trashed"
+	OutcomeFailed       Outcome = "failed"
+	OutcomeNotAttempted Outcome = "not-attempted"
 )
 
 // errVanished marks an item that was already gone when the Cleanup reached it.
@@ -57,7 +61,10 @@ type Options struct {
 	TrashDir string
 	StateDir string
 	DryRun   bool
-	Now      func() time.Time
+	// Permanent forces ModePermanent for every selected item, bypassing the
+	// Trash whatever the item's Risk Level or Rebuild Cost.
+	Permanent bool
+	Now       func() time.Time
 
 	// Emit receives one started and one finished event per Junk Item, from the
 	// goroutine that runs the Cleanup.
@@ -115,14 +122,17 @@ type Failure struct {
 
 // Summary is the arithmetic the user is asked to trust. Space Freed and Space
 // Moved never overlap: freed + moved is exactly the bytes of the items the run
-// removed successfully. On a dry run the same numbers are projections of what
-// the run would do, which is what makes the plan worth reading.
+// removed successfully. NotAttempted counts the selected items a cancelled run
+// left untouched; they contribute no bytes. On a dry run the same numbers are
+// projections of what the run would do, which is what makes the plan worth
+// reading.
 type Summary struct {
-	FreedBytes int64     `json:"freed_bytes"`
-	MovedBytes int64     `json:"moved_bytes"`
-	Items      int       `json:"items"`
-	Failed     []Failure `json:"failed"`
-	LogPath    string    `json:"log_path"`
+	FreedBytes   int64     `json:"freed_bytes"`
+	MovedBytes   int64     `json:"moved_bytes"`
+	Items        int       `json:"items"`
+	NotAttempted int       `json:"not_attempted"`
+	Failed       []Failure `json:"failed"`
+	LogPath      string    `json:"log_path"`
 }
 
 // Result is the schema v1 document of a clean run.
@@ -130,6 +140,7 @@ type Result struct {
 	Schema    int     `json:"schema"`
 	CleanedAt string  `json:"cleaned_at"`
 	DryRun    bool    `json:"dry_run"`
+	Cancelled bool    `json:"cancelled"`
 	Items     []Item  `json:"items"`
 	Summary   Summary `json:"summary"`
 }
@@ -206,7 +217,7 @@ func Run(ctx context.Context, selected []Candidate, opts Options) (Result, error
 
 	var log *os.File
 	if !opts.DryRun {
-		if needsTrash(selected) {
+		if needsTrash(selected, opts.Permanent) {
 			if opts.TrashDir == "" {
 				return result, errors.New("clean: no Trash directory configured")
 			}
@@ -225,13 +236,30 @@ func Run(ctx context.Context, selected []Candidate, opts Options) (Result, error
 		result.Summary.LogPath = path
 	}
 
-	for _, c := range selected {
-		if err := ctx.Err(); err != nil {
-			return result, err
+	for i, c := range selected {
+		if ctx.Err() != nil {
+			result.Cancelled = true
+			for _, rest := range selected[i:] {
+				item := Item{
+					Candidate: rest,
+					Mode:      modeFor(rest, opts.Permanent),
+					Outcome:   OutcomeNotAttempted,
+					Timestamp: now().Format(time.RFC3339),
+				}
+				if log != nil {
+					if err := appendLog(log, item); err != nil {
+						return result, fmt.Errorf("clean: writing the Cleanup Log: %w", err)
+					}
+				}
+				result.Items = append(result.Items, item)
+				result.Summary.NotAttempted++
+				emit(opts, Event{Kind: EventItemFinished, Item: item, Summary: snapshot(result.Summary)})
+			}
+			break
 		}
 		item := Item{
 			Candidate: c,
-			Mode:      ModeFor(c.Risk, c.Rebuild),
+			Mode:      modeFor(c, opts.Permanent),
 			Timestamp: now().Format(time.RFC3339),
 		}
 		emit(opts, Event{Kind: EventItemStarted, Item: item, Summary: snapshot(result.Summary)})
@@ -239,10 +267,10 @@ func Run(ctx context.Context, selected []Candidate, opts Options) (Result, error
 		if opts.DryRun {
 			item.Outcome = OutcomePlanned
 			result.Summary.Items++
-			if item.Mode == ModeDelete {
-				result.Summary.FreedBytes += item.Size
-			} else {
+			if item.Mode == ModeTrash {
 				result.Summary.MovedBytes += item.Size
+			} else {
+				result.Summary.FreedBytes += item.Size
 			}
 			result.Items = append(result.Items, item)
 			emit(opts, Event{Kind: EventItemFinished, Item: item, Summary: snapshot(result.Summary)})
@@ -258,13 +286,13 @@ func Run(ctx context.Context, selected []Candidate, opts Options) (Result, error
 				Reason: reason,
 				Error:  detail,
 			})
-		} else if item.Mode == ModeDelete {
-			item.Outcome = OutcomeDeleted
-			result.Summary.FreedBytes += item.Size
-			result.Summary.Items++
-		} else {
+		} else if item.Mode == ModeTrash {
 			item.Outcome = OutcomeTrashed
 			result.Summary.MovedBytes += item.Size
+			result.Summary.Items++
+		} else {
+			item.Outcome = OutcomeDeleted
+			result.Summary.FreedBytes += item.Size
 			result.Summary.Items++
 		}
 
@@ -292,8 +320,20 @@ func snapshot(s Summary) Summary {
 	return s
 }
 
+// modeFor is the deletion mode for one item: --permanent overrides the hybrid
+// policy for the whole selection.
+func modeFor(c Candidate, permanent bool) Mode {
+	if permanent {
+		return ModePermanent
+	}
+	return ModeFor(c.Risk, c.Rebuild)
+}
+
 // needsTrash reports whether any selected item has to be moved into the Trash.
-func needsTrash(selected []Candidate) bool {
+func needsTrash(selected []Candidate, permanent bool) bool {
+	if permanent {
+		return false
+	}
 	for _, c := range selected {
 		if ModeFor(c.Risk, c.Rebuild) == ModeTrash {
 			return true
@@ -312,10 +352,10 @@ func apply(trashDir, path string, mode Mode) error {
 		}
 		return err
 	}
-	if mode == ModeDelete {
-		return os.RemoveAll(path)
+	if mode == ModeTrash {
+		return os.Rename(path, freePath(trashDir, filepath.Base(path)))
 	}
-	return os.Rename(path, freePath(trashDir, filepath.Base(path)))
+	return os.RemoveAll(path)
 }
 
 // freePath picks a name inside dir that is not taken yet, the way Finder does:

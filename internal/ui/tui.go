@@ -31,10 +31,11 @@ func Supported() bool {
 // the background, so the screen is responsive — and cancellable — from the
 // first frame; a Cleanup runs in the background too, so the per-item progress
 // is visible while it happens.
-func Run(stdout io.Writer, scan engine.Options, cleanup clean.Options) error {
-	p := tea.NewProgram(newScreen(scan, cleanup), tea.WithOutput(stdout), tea.WithAltScreen())
-	_, err := p.Run()
-	return err
+func Run(stdout io.Writer, scan engine.Options, cleanup clean.Options) (incomplete bool, err error) {
+	screen := newScreen(scan, cleanup)
+	p := tea.NewProgram(screen, tea.WithOutput(stdout), tea.WithAltScreen())
+	_, err = p.Run()
+	return screen.model.CleanupIncomplete(), err
 }
 
 // progressMsg carries one engine.Progress event.
@@ -71,15 +72,18 @@ type screen struct {
 	// msgs is the one channel every worker writes to: the scan's progress, the
 	// Cleanup's events, and both terminal results. It is never closed, because
 	// the scan and the Cleanup are separate lifetimes.
-	msgs   chan tea.Msg
-	quit   chan struct{}
-	cancel context.CancelFunc
-	closed bool
+	msgs        chan tea.Msg
+	quit        chan struct{}
+	cancel      context.CancelFunc
+	cleanCancel context.CancelFunc
+	closed      bool
 }
 
 func newScreen(scan engine.Options, cleanup clean.Options) *screen {
+	model := New(scan.Home, time.Now())
+	model.SetPermanent(cleanup.Permanent)
 	return &screen{
-		model:   New(scan.Home, time.Now()),
+		model:   model,
 		scan:    scan,
 		cleanup: cleanup,
 		msgs:    make(chan tea.Msg, 64),
@@ -131,6 +135,7 @@ func (s *screen) startClean() {
 		return
 	}
 	opts := s.cleanup
+	opts.Permanent = s.model.Permanent()
 	opts.Emit = func(ev clean.Event) {
 		// Blocking on purpose: a dropped finished event would make a row lie
 		// about what happened. The buffer and the reader keep up in practice.
@@ -139,8 +144,11 @@ func (s *screen) startClean() {
 		case <-s.quit:
 		}
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cleanCancel = cancel
 	go func() {
-		result, err := clean.Run(context.Background(), selected, opts)
+		result, err := clean.Run(ctx, selected, opts)
+		cancel()
 		select {
 		case s.msgs <- cleanDoneMsg{result: result, err: err}:
 		case <-s.quit:
@@ -179,6 +187,10 @@ func (s *screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if s.cancel != nil {
 				s.cancel()
 			}
+		case ActionCancelClean:
+			if s.cleanCancel != nil {
+				s.cleanCancel()
+			}
 		case ActionClean:
 			s.startClean()
 		}
@@ -194,6 +206,7 @@ func (s *screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		s.model.ApplyCleanEvent(clean.Event(msg))
 
 	case cleanDoneMsg:
+		s.cleanCancel = nil
 		s.model.FinishClean(msg.result, msg.err)
 
 	case tickMsg:
@@ -216,6 +229,9 @@ func (s *screen) shutdown() {
 	close(s.quit)
 	if s.cancel != nil {
 		s.cancel()
+	}
+	if s.cleanCancel != nil {
+		s.cleanCancel()
 	}
 }
 

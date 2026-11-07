@@ -2,8 +2,10 @@ package clean_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/thewindear/free-clean-my-macos/internal/clean"
@@ -190,5 +192,132 @@ func TestSelectThenRunIsTheCLIPath(t *testing.T) {
 	}
 	if len(result.Items) != 1 {
 		t.Fatalf("items = %+v, want 1", result.Items)
+	}
+}
+
+// TestPermanentOverridesTheHybridPolicy pins --permanent: caution and
+// high-rebuild items are deleted outright, and every byte is Space Freed.
+func TestPermanentOverridesTheHybridPolicy(t *testing.T) {
+	dir := t.TempDir()
+	cheap := makeItem(t, dir, "cheap", 1024, rules.RiskSafe, rules.RebuildLow)
+	dear := makeItem(t, dir, "dear", 2048, rules.RiskCaution, rules.RebuildHigh)
+
+	result, err := clean.Run(context.Background(), []clean.Candidate{cheap, dear}, clean.Options{
+		TrashDir:  filepath.Join(dir, "trash"),
+		StateDir:  filepath.Join(dir, "state"),
+		Permanent: true,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	for _, c := range []clean.Candidate{cheap, dear} {
+		if _, err := os.Lstat(c.Path); !os.IsNotExist(err) {
+			t.Errorf("permanent item %q is still on disk: %v", c.Path, err)
+		}
+	}
+	for _, it := range result.Items {
+		if it.Mode != clean.ModePermanent {
+			t.Errorf("mode = %q, want permanent", it.Mode)
+		}
+		if it.Outcome != clean.OutcomeDeleted {
+			t.Errorf("outcome = %q, want deleted", it.Outcome)
+		}
+	}
+	if result.Summary.FreedBytes != cheap.Size+dear.Size {
+		t.Errorf("freed = %d, want every byte %d", result.Summary.FreedBytes, cheap.Size+dear.Size)
+	}
+	if result.Summary.MovedBytes != 0 {
+		t.Errorf("moved = %d, want 0 under Permanent Delete", result.Summary.MovedBytes)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "trash")); err == nil {
+		t.Error("Permanent Delete created the Trash directory")
+	}
+}
+
+// TestCancelLetsTheInFlightItemFinish keeps cancellation honest: the item
+// already being removed finishes, the rest are not attempted, and every
+// selected item still gets one Cleanup Log record.
+func TestCancelLetsTheInFlightItemFinish(t *testing.T) {
+	dir := t.TempDir()
+	first := makeItem(t, dir, "first", 1024, rules.RiskSafe, rules.RebuildLow)
+	second := makeItem(t, dir, "second", 2048, rules.RiskSafe, rules.RebuildLow)
+	third := makeItem(t, dir, "third", 4096, rules.RiskSafe, rules.RebuildLow)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var started int
+	result, err := clean.Run(ctx, []clean.Candidate{first, second, third}, clean.Options{
+		TrashDir: filepath.Join(dir, "trash"),
+		StateDir: filepath.Join(dir, "state"),
+		Emit: func(ev clean.Event) {
+			if ev.Kind == clean.EventItemStarted {
+				started++
+				if started == 1 {
+					cancel()
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if !result.Cancelled {
+		t.Error("result should record that the run was cancelled")
+	}
+	if result.Summary.Items != 1 || result.Summary.NotAttempted != 2 {
+		t.Errorf("summary = %+v, want 1 done and 2 not attempted", result.Summary)
+	}
+	if result.Summary.FreedBytes != first.Size {
+		t.Errorf("freed = %d, want only the in-flight item's %d", result.Summary.FreedBytes, first.Size)
+	}
+	if _, err := os.Lstat(first.Path); !os.IsNotExist(err) {
+		t.Errorf("the in-flight item was not removed: %v", err)
+	}
+	for _, c := range []clean.Candidate{second, third} {
+		if _, err := os.Lstat(c.Path); err != nil {
+			t.Errorf("not-attempted item %q was touched: %v", c.Path, err)
+		}
+	}
+
+	outcomes := map[string]clean.Outcome{}
+	for _, it := range result.Items {
+		outcomes[it.Path] = it.Outcome
+	}
+	if outcomes[first.Path] != clean.OutcomeDeleted {
+		t.Errorf("first outcome = %q, want deleted", outcomes[first.Path])
+	}
+	for _, c := range []clean.Candidate{second, third} {
+		if outcomes[c.Path] != clean.OutcomeNotAttempted {
+			t.Errorf("%s outcome = %q, want not-attempted", c.Path, outcomes[c.Path])
+		}
+	}
+
+	data, err := os.ReadFile(result.Summary.LogPath)
+	if err != nil {
+		t.Fatalf("reading the Cleanup Log: %v", err)
+	}
+	var records []clean.Item
+	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec clean.Item
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line is not JSON: %v\n%s", err, line)
+		}
+		records = append(records, rec)
+	}
+	if len(records) != 3 {
+		t.Fatalf("Cleanup Log has %d records, want one per selected item", len(records))
+	}
+	counts := map[clean.Outcome]int{}
+	for _, rec := range records {
+		counts[rec.Outcome]++
+	}
+	if counts[clean.OutcomeDeleted] != 1 || counts[clean.OutcomeNotAttempted] != 2 {
+		t.Errorf("log outcomes = %v, want one deleted and two not-attempted", counts)
 	}
 }

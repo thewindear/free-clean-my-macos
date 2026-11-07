@@ -37,11 +37,11 @@ Usage:
   fcm                      open the list screen
   fcm scan [--json] [--compact] [--rules-dir DIR] [--jobs N]
                            scan and report, exit 3 when there is nothing to clean
-  fcm clean --dry-run [--json] [--only-kind cache,log] [--jobs N]
+  fcm clean --dry-run [--json] [--only-kind cache,log] [--jobs N] [--permanent]
                            print the removal plan and touch nothing
-  fcm clean --yes [--json] [--trash-dir DIR] [--only-kind cache,log] [--jobs N]
+  fcm clean --yes [--json] [--trash-dir DIR] [--only-kind cache,log] [--jobs N] [--permanent]
                            remove every Junk Item: cheap ones deleted outright,
-                           the rest moved into the Trash
+                           the rest moved into the Trash; --permanent bypasses it
   fcm help                 show this message
 
 User rules live in ~/.config/free-clean-my-macos/rules.d/*.yaml; a rule with the
@@ -87,8 +87,12 @@ func runList(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "fcm: %v\n", err)
 		return ExitPartialFailed
 	}
-	if err := ui.Run(stdout, opts, cleanOptions("", false)); err != nil {
+	incomplete, err := ui.Run(stdout, opts, cleanOptions("", false, false))
+	if err != nil {
 		fmt.Fprintf(stderr, "fcm: %v\n", err)
+		return ExitPartialFailed
+	}
+	if incomplete {
 		return ExitPartialFailed
 	}
 	return ExitOK
@@ -97,16 +101,17 @@ func runList(stdout, stderr io.Writer) int {
 // cleanOptions is where a Cleanup puts what it removes and logs what it did. The
 // CLI passes its flags in; the list screen uses the defaults, so both paths
 // write to the same Trash and the same Cleanup Log.
-func cleanOptions(trashDir string, dryRun bool) clean.Options {
+func cleanOptions(trashDir string, dryRun, permanent bool) clean.Options {
 	home := os.Getenv("HOME")
 	trash := trashDir
 	if trash == "" {
 		trash = filepath.Join(home, ".Trash")
 	}
 	return clean.Options{
-		TrashDir: trash,
-		StateDir: stateDir(home),
-		DryRun:   dryRun,
+		TrashDir:  trash,
+		StateDir:  stateDir(home),
+		DryRun:    dryRun,
+		Permanent: permanent,
 	}
 }
 
@@ -185,6 +190,7 @@ func runClean(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	onlyKind := fs.String("only-kind", "", "comma-separated Kind filter, e.g. cache,log")
 	rulesDir := fs.String("rules-dir", "", "load user Scan Rules from this directory")
 	jobs := fs.Int("jobs", 0, "bounded scan parallelism (default min(8, NumCPU/2))")
+	permanent := fs.Bool("permanent", false, "delete the whole selection outright, bypassing the Trash")
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
 	}
@@ -220,7 +226,7 @@ func runClean(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return ExitPartialFailed
 	}
 
-	result, err := clean.Run(ctx, clean.Select(report, kinds), cleanOptions(*trashDir, *dryRun))
+	result, err := clean.Run(ctx, clean.Select(report, kinds), cleanOptions(*trashDir, *dryRun, *permanent))
 	if err != nil {
 		fmt.Fprintf(stderr, "fcm clean: %v\n", err)
 		return ExitPartialFailed
@@ -235,7 +241,7 @@ func runClean(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		writeCleanText(stdout, result)
 	}
 
-	if len(result.Summary.Failed) > 0 {
+	if len(result.Summary.Failed) > 0 || result.Summary.NotAttempted > 0 {
 		return ExitPartialFailed
 	}
 	if len(result.Items) == 0 {
@@ -252,7 +258,8 @@ func writeCleanText(w io.Writer, result clean.Result) {
 		verb = "Would clean"
 	}
 	total := result.Summary.FreedBytes + result.Summary.MovedBytes
-	fmt.Fprintf(w, "%s %d items · %s\n\n", verb, len(result.Items), format.Bytes(total))
+	attempted := len(result.Items) - result.Summary.NotAttempted
+	fmt.Fprintf(w, "%s %d items · %s\n\n", verb, attempted, format.Bytes(total))
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, it := range result.Items {
@@ -272,6 +279,14 @@ func writeCleanText(w io.Writer, result clean.Result) {
 			fmt.Fprintf(w, "  %s (%s)\n", abbreviateHome(f.Path), f.Reason)
 		}
 	}
+	if result.Summary.NotAttempted > 0 {
+		fmt.Fprintf(w, "\n%d not attempted (cleanup stopped):\n", result.Summary.NotAttempted)
+		for _, it := range result.Items {
+			if it.Outcome == clean.OutcomeNotAttempted {
+				fmt.Fprintf(w, "  %s\n", abbreviateHome(it.Path))
+			}
+		}
+	}
 	if result.Summary.LogPath != "" {
 		fmt.Fprintf(w, "\nCleanup Log  %s\n", abbreviateHome(result.Summary.LogPath))
 	}
@@ -282,13 +297,20 @@ func writeCleanText(w io.Writer, result clean.Result) {
 
 // outcomeLabel names one row of the plan: what will happen, or what did.
 func outcomeLabel(it clean.Item) string {
-	if it.Outcome == clean.OutcomeFailed {
+	switch it.Outcome {
+	case clean.OutcomeFailed:
 		return "failed"
+	case clean.OutcomeNotAttempted:
+		return "not attempted"
 	}
-	if it.Mode == clean.ModeDelete {
+	switch it.Mode {
+	case clean.ModeDelete:
 		return "delete"
+	case clean.ModePermanent:
+		return "delete (permanent)"
+	default:
+		return "trash"
 	}
-	return "trash"
 }
 
 // parseKinds validates the --only-kind selection against the domain's Kinds.
