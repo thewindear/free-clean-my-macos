@@ -1,0 +1,94 @@
+name: release
+
+# Tag a release: `git tag v0.1.0 && git push origin v0.1.0`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # The process-boundary tests exec `du` and `plutil`, so they need macOS.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Formatting, vet and tests
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: Build the darwin tarballs
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          ldflags="-s -w -X github.com/thewindear/free-clean-my-macos/internal/cli.version=${version}"
+          host="$(go env GOARCH)"
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            # CGO off keeps the binary self-contained: no runtime to install and
+            # nothing to sign.
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+              go build -trimpath -ldflags "$ldflags" -o dist/fcm .
+            if [ "$arch" = "$host" ]; then
+              # A release binary that cannot run is not a release.
+              ./dist/fcm version
+            fi
+            tar -C dist -czf "dist/fcm_${version}_darwin_${arch}.tar.gz" fcm
+            rm dist/fcm
+          done
+          ( cd dist && shasum -a 256 ./*.tar.gz > checksums.txt )
+          cat dist/checksums.txt
+
+      - name: Render the Homebrew formula
+        run: |
+          set -euo pipefail
+          arm="$(awk '$2 ~ /arm64/ {print $1}' dist/checksums.txt)"
+          intel="$(awk '$2 ~ /amd64/ {print $1}' dist/checksums.txt)"
+          sed -e "s/@VERSION@/${VERSION}/g" \
+              -e "s/@SHA_ARM64@/${arm}/g" \
+              -e "s/@SHA_AMD64@/${intel}/g" \
+              packaging/free-clean-my-macos.rb.in > dist/free-clean-my-macos.rb
+          ruby -c dist/free-clean-my-macos.rb
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "fcm ${VERSION}" \
+            --generate-notes \
+            --verify-tag \
+            dist/fcm_*_darwin_*.tar.gz dist/checksums.txt dist/free-clean-my-macos.rb
+
+      - name: Commit the formula to the tap
+        # This repository doubles as the Homebrew tap: `Formula/` is where
+        # `brew tap thewindear/free-clean-my-macos` looks for it. The release
+        # itself has already been published, so losing this race only means the
+        # formula needs re-running — hence continue-on-error.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          mkdir -p Formula
+          cp dist/free-clean-my-macos.rb Formula/free-clean-my-macos.rb
+          if git diff --quiet -- Formula/free-clean-my-macos.rb; then
+            echo "The formula is already current."
+            exit 0
+          fi
+          git add Formula/free-clean-my-macos.rb
+          git commit -m "chore: Homebrew formula for ${GITHUB_REF_NAME}"
+          git push origin main
