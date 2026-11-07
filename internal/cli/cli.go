@@ -23,6 +23,11 @@ import (
 	"github.com/thewindear/free-clean-my-macos/internal/ui"
 )
 
+// version is the release version. The release workflow sets it with
+// -ldflags "-X github.com/thewindear/free-clean-my-macos/internal/cli.version=v1.2.3";
+// a `go build` from a checkout reports "dev".
+var version = "dev"
+
 // Exit codes.
 const (
 	ExitOK            = 0
@@ -42,6 +47,11 @@ Usage:
   fcm clean --yes [--json] [--trash-dir DIR] [--only-kind cache,log] [--jobs N]
                            remove every Junk Item: cheap ones deleted outright,
                            the rest moved into the Trash
+  fcm rules list [--rules-dir DIR]
+                           print the effective Scan Rules and mark the overrides
+  fcm rules reload [--rules-dir DIR]
+                           re-read the rule files and report what changed
+  fcm version              print the version
   fcm help                 show this message
 
 User rules live in ~/.config/free-clean-my-macos/rules.d/*.yaml; a rule with the
@@ -68,6 +78,11 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return runScan(ctx, args[1:], stdout, stderr)
 	case "clean":
 		return runClean(ctx, args[1:], stdout, stderr)
+	case "rules":
+		return runRules(args[1:], stdout, stderr)
+	case "version", "-version", "--version":
+		fmt.Fprintf(stdout, "fcm %s\n", version)
+		return ExitOK
 	default:
 		fmt.Fprintf(stderr, "fcm: unknown command %q\n\n%s", args[0], usage)
 		return ExitUsage
@@ -242,6 +257,177 @@ func runClean(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return ExitNothingToDo
 	}
 	return ExitOK
+}
+
+// runRules is `fcm rules list` and `fcm rules reload`. The subcommand comes
+// first, then its flags, and both read the same directory the scanner would:
+// --rules-dir, or ~/.config/free-clean-my-macos/rules.d.
+func runRules(args []string, stdout, stderr io.Writer) int {
+	const hint = "fcm rules: pass `list` or `reload` first\n\n"
+	if len(args) == 0 {
+		fmt.Fprintf(stderr, "%s%s", hint, usage)
+		return ExitUsage
+	}
+	sub, rest := args[0], args[1:]
+	if strings.HasPrefix(sub, "-") {
+		fmt.Fprintf(stderr, "%s%s", hint, usage)
+		return ExitUsage
+	}
+
+	fs := flag.NewFlagSet("rules "+sub, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	rulesDir := fs.String("rules-dir", "", "load user Scan Rules from this directory")
+	if err := fs.Parse(rest); err != nil {
+		return ExitUsage
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "fcm rules %s: unexpected argument %q\n", sub, fs.Arg(0))
+		return ExitUsage
+	}
+
+	dir := *rulesDir
+	if dir == "" {
+		dir = filepath.Join(os.Getenv("HOME"), ".config", "free-clean-my-macos", "rules.d")
+	}
+	set, err := loadRuleSet(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "fcm rules %s: %v\n", sub, err)
+		return ExitPartialFailed
+	}
+
+	switch sub {
+	case "list":
+		writeRulesList(stdout, set)
+		return ExitOK
+	case "reload":
+		writeRulesReload(stdout, set)
+		return ExitOK
+	default:
+		fmt.Fprintf(stderr, "fcm rules: unknown command %q\n\n%s", sub, usage)
+		return ExitUsage
+	}
+}
+
+// ruleSet is the effective rule set together with where it came from.
+type ruleSet struct {
+	Dir       string
+	Files     []rules.File
+	Effective []rules.Effective
+}
+
+// loadRuleSet re-reads the rule files from disk every time: there is no cache
+// between invocations, which is what makes `rules reload` honest.
+func loadRuleSet(dir string) (ruleSet, error) {
+	files, err := rules.LoadFiles(dir)
+	if err != nil {
+		return ruleSet{}, err
+	}
+	var overrides []rules.Rule
+	for _, f := range files {
+		overrides = append(overrides, f.Rules...)
+	}
+	return ruleSet{
+		Dir:       dir,
+		Files:     files,
+		Effective: rules.EffectiveRules(rules.Default(), overrides),
+	}, nil
+}
+
+// ruleCounts is the header arithmetic: embedded rules, user rules, and how many
+// of the user rules replaced an embedded one.
+func (s ruleSet) ruleCounts() (embedded, user, overrides int) {
+	for _, e := range s.Effective {
+		switch e.Source {
+		case rules.SourceEmbedded:
+			embedded++
+		case rules.SourceUser:
+			user++
+		case rules.SourceOverride:
+			user++
+			overrides++
+		}
+	}
+	return embedded, user, overrides
+}
+
+// writeRulesList prints the effective rule set. Overridden rules are marked with
+// `*` and named again under the table, so it is clear what a user rule replaced.
+func writeRulesList(w io.Writer, set ruleSet) {
+	embedded, user, overrides := set.ruleCounts()
+	fmt.Fprintf(w, "Effective Scan Rules — %d (%d embedded, %d user, %s)\n\n",
+		len(set.Effective), embedded, user, format.Count(overrides, "override"))
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%s\n", "NAME", "SOURCE", "KIND", "RISK", "REBUILD", "PATTERN")
+	for _, e := range set.Effective {
+		mark := " "
+		if e.Source == rules.SourceOverride {
+			mark = "*"
+		}
+		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\t%s\t%s\n",
+			mark, e.Rule.Name, e.Source, e.Rule.Kind, e.Rule.Risk, e.Rule.Rebuild,
+			strings.Join(e.Rule.PathPatterns(), ", "))
+	}
+	tw.Flush()
+
+	marked := false
+	for _, e := range set.Effective {
+		if e.Source != rules.SourceOverride || e.Superseded == nil {
+			continue
+		}
+		if !marked {
+			fmt.Fprintln(w)
+			marked = true
+		}
+		fmt.Fprintf(w, "  * %s replaces the embedded rule for %s\n",
+			e.Rule.Name, strings.Join(e.Superseded.PathPatterns(), ", "))
+	}
+
+	fmt.Fprintf(w, "\nRules directory  %s", abbreviateHome(set.Dir))
+	if len(set.Files) == 0 {
+		fmt.Fprint(w, " (no rule files yet)")
+	} else {
+		fmt.Fprintf(w, " (%s)", format.Count(len(set.Files), "file"))
+	}
+	fmt.Fprintln(w)
+}
+
+// writeRulesReload says what the reload actually read and what it changed, which
+// is the only reason to run it after editing a rule file.
+func writeRulesReload(w io.Writer, set ruleSet) {
+	fmt.Fprintf(w, "Reloaded from %s\n\n", abbreviateHome(set.Dir))
+	if len(set.Files) == 0 {
+		fmt.Fprintln(w, "  no rule files yet")
+	} else {
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		for _, f := range set.Files {
+			fmt.Fprintf(tw, "  %s\t%s\n", filepath.Base(f.Path), format.Count(len(f.Rules), "rule"))
+		}
+		tw.Flush()
+	}
+
+	embedded, user, overrides := set.ruleCounts()
+	fmt.Fprintf(w, "\nEffective: %d embedded, %s (%s)\n",
+		embedded, format.Count(user, "user rule"), format.Count(overrides, "replacing an embedded rule"))
+
+	var added, replaced []string
+	for _, e := range set.Effective {
+		switch e.Source {
+		case rules.SourceUser:
+			added = append(added, e.Rule.Name)
+		case rules.SourceOverride:
+			replaced = append(replaced, e.Rule.Name)
+		}
+	}
+	fmt.Fprintf(w, "New rules:  %s\n", namesOrNone(added))
+	fmt.Fprintf(w, "Overrides:  %s\n", namesOrNone(replaced))
+}
+
+func namesOrNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
 }
 
 // writeCleanText prints the plan or the Summary. Space Freed and Space Moved

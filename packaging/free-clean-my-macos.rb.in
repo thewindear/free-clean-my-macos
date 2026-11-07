@@ -1,0 +1,32 @@
+# typed: strict
+# frozen_string_literal: true
+
+# Rendered by .github/workflows/release.yml at tag time: the version and both
+# checksums below come from that release's tarballs. Do not edit
+# Formula/free-clean-my-macos.rb by hand — re-run the workflow for the tag.
+class FreeCleanMyMacos < Formula
+  desc "Whitelist-based macOS junk scanner and cleaner"
+  homepage "https://github.com/thewindear/free-clean-my-macos"
+  version "@VERSION@"
+  depends_on :macos
+
+  on_macos do
+    on_arm do
+      url "https://github.com/thewindear/free-clean-my-macos/releases/download/v@VERSION@/fcm_@VERSION@_darwin_arm64.tar.gz"
+      sha256 "@SHA_ARM64@"
+    end
+
+    on_intel do
+      url "https://github.com/thewindear/free-clean-my-macos/releases/download/v@VERSION@/fcm_@VERSION@_darwin_amd64.tar.gz"
+      sha256 "@SHA_AMD64@"
+    end
+  end
+
+  def install
+    bin.install "fcm"
+  end
+
+  test do
+    assert_match "fcm @VERSION@", shell_output("#{bin}/fcm version")
+  end
+end
